@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .database import Base, engine
 from .routers import items, shelves, pantries, reservations
@@ -11,6 +12,15 @@ app = FastAPI(
     title="NourishNet API",
     description="Backend for the NourishNet smart-shelf food recovery system.",
     version="0.1.0",
+)
+
+# Allows the local Vite dev server (and other origins during development)
+# to call this API from the browser.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(items.router)
