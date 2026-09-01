@@ -36,11 +36,11 @@ services:
         generateValue: true
 
       # Comma-separated list of frontend origins allowed to call this API.
-      # Your Vercel production URL goes here, e.g.
-      #   https://nourishnet.vercel.app
-      # Include preview domains only if you actually test against them.
+      # Not a secret — it's the public Vercel URL — so it lives here rather
+      # than being typed into the dashboard. Exact origin match: https://,
+      # no trailing slash, no path.
       - key: CORS_ORIGINS
-        sync: false
+        value: "https://nourish-net-coral.vercel.app"
 
       # Token lifetimes, in hours (FR-1.5).
       - key: STAFF_TOKEN_HOURS
