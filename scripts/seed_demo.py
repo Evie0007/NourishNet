@@ -107,8 +107,11 @@ def main():
         )
 
         # Sample inventory, only if the store is empty — re-running the
-        # script shouldn't keep piling on shelves.
-        if db.query(models.Shelf).count() == 0:
+        # script shouldn't keep piling on shelves. Pass --with-inventory to
+        # add it anyway, for a database that has shelves but nothing in a
+        # demo-able state (e.g. every item already picked up).
+        force_inventory = "--with-inventory" in sys.argv
+        if db.query(models.Shelf).count() == 0 or force_inventory:
             print("Sample inventory:")
             now = datetime.utcnow()
             shelves = [
