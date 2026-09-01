@@ -41,6 +41,39 @@ class ReservationStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class UserRole(str, enum.Enum):
+    """
+    FR-2.1: every user holds exactly one role. STAFF and MANAGER are store
+    roles; ORG_COORDINATOR is the pantry-side "Organizer" and is the only
+    role that carries a pantry_id (FR-2.2).
+    """
+    STAFF = "staff"
+    MANAGER = "manager"
+    ADMIN = "admin"
+    ORG_COORDINATOR = "org_coordinator"
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    email = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)
+    full_name = Column(String, nullable=True)
+
+    role = Column(SAEnum(UserRole), nullable=False)
+
+    # Set for ORG_COORDINATOR only. Store roles leave this null (FR-2.2).
+    # This is the single source of truth for which org a coordinator acts
+    # as — never a client-supplied value (FR-2.3).
+    pantry_id = Column(UUID(as_uuid=False), ForeignKey("pantries.id"), nullable=True)
+    pantry = relationship("Pantry", back_populates="users")
+
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_login_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Shelf(Base):
     __tablename__ = "shelves"
 
@@ -99,6 +132,7 @@ class Pantry(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     reservations = relationship("Reservation", back_populates="pantry")
+    users = relationship("User", back_populates="pantry")
 
 
 class Reservation(Base):

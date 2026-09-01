@@ -1,10 +1,25 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg2-binary
-pydantic
-pydantic-settings
-python-dotenv
-google-cloud-vision
-python-multipart
-email-validator
+# Pinned to the versions this app was built and tested against (NFR-4.1.8).
+# Unpinned, any build could silently pull a different — or compromised —
+# version, and a deploy that worked yesterday breaks today.
+#
+# To upgrade: bump deliberately, run the app, then commit the new pin.
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+sqlalchemy==2.0.52
+psycopg2-binary==2.9.12
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+email-validator==2.3.0
+
+# Auth
+bcrypt==5.0.0
+pyjwt==2.13.0
+
+# OCR pipeline. Nothing imports app/ocr.py yet, so this is not needed at
+# runtime — it's the single largest thing in the build (grpcio, protobuf).
+# If Render builds get slow or memory-tight on the free plan, comment this
+# out; re-enable it when the Vision pipeline is actually wired in.
+google-cloud-vision==3.15.0

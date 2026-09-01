@@ -5,3 +5,4 @@ gcp-vision-key.json
 nourishnet.db
 .venv/
 venv/
+nourishnet_local.db

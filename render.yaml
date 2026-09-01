@@ -1,0 +1,49 @@
+# Render Blueprint for the NourishNet API.
+#
+# Render reads this from the repo root. In the dashboard: New → Blueprint,
+# point it at github.com/Evie0007/NourishNet, and it creates the service
+# below. Values marked `sync: false` are NOT stored in this file — Render
+# prompts for them at deploy time, which is how secrets stay out of git.
+
+services:
+  - type: web
+    name: nourishnet-api
+    runtime: python
+    plan: free
+    # Oregon is the closest Render region to the Supabase us-east-2 pooler
+    # among the free-plan options; move both together if you ever care about
+    # the round trip.
+    region: oregon
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # Render polls this to decide the deploy succeeded. Without it, a service
+    # that boots but can't serve still shows as live.
+    healthCheckPath: /health
+
+    envVars:
+      # Supabase connection string. Use the POOLER host
+      # (…pooler.supabase.com), not the direct db.… host — the direct one is
+      # IPv6-only and Render cannot reach it.
+      - key: DATABASE_URL
+        sync: false
+
+      # Render generates a strong random value on first deploy. Do not reuse
+      # the local dev secret. Changing it signs everyone out, which is the
+      # correct behavior if it ever leaks.
+      - key: JWT_SECRET
+        generateValue: true
+
+      # Comma-separated list of frontend origins allowed to call this API.
+      # Your Vercel production URL goes here, e.g.
+      #   https://nourishnet.vercel.app
+      # Include preview domains only if you actually test against them.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # Token lifetimes, in hours (FR-1.5).
+      - key: STAFF_TOKEN_HOURS
+        value: "8"
+      - key: ORG_TOKEN_HOURS
+        value: "24"

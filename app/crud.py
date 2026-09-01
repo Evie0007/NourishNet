@@ -8,6 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models, schemas
@@ -133,22 +134,97 @@ def list_pantries(db: Session, verified_only: bool = False):
     return q.all()
 
 
+# ---------- Users ----------
+
+def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
+    """Case-insensitive: people type their email with whatever capitalization
+    their phone keyboard decided on."""
+    return (
+        db.query(models.User)
+        .filter(func.lower(models.User.email) == email.strip().lower())
+        .first()
+    )
+
+
 # ---------- Reservations ----------
 
-def create_reservation(db: Session, res: schemas.ReservationCreate) -> Optional[models.Reservation]:
-    item = db.get(models.Item, res.item_id)
-    if not item or item.status != models.ItemStatus.AVAILABLE:
-        return None  # can't reserve something that isn't available
+def create_reservation(
+    db: Session,
+    res: schemas.ReservationCreate,
+    pantry_id: str,
+) -> Optional[models.Reservation]:
+    """
+    Claims an AVAILABLE item for `pantry_id` and starts the holding-window
+    clock. `pantry_id` comes from the authenticated user, never from the
+    request body (FR-2.3).
 
-    hold_expires_at = datetime.utcnow() + timedelta(minutes=res.hold_minutes)
+    The claim is a conditional UPDATE rather than a read-then-write. The
+    previous version read item.status, then wrote, with no lock in
+    between — two concurrent requests could both observe "available" and
+    both succeed, producing two valid QR codes for one physical item
+    (NFR-4.7.1). Here the database decides the winner: whoever's UPDATE
+    matches zero rows lost the race and gets the same 409 as someone
+    reserving an already-taken item.
+    """
+    claimed = (
+        db.query(models.Item)
+        .filter(models.Item.id == res.item_id)
+        .filter(models.Item.status == models.ItemStatus.AVAILABLE)
+        .update(
+            {models.Item.status: models.ItemStatus.RESERVED},
+            synchronize_session=False,
+        )
+    )
+    if claimed == 0:
+        db.rollback()
+        return None
+
     db_res = models.Reservation(
         item_id=res.item_id,
-        pantry_id=res.pantry_id,
-        hold_expires_at=hold_expires_at,
+        pantry_id=pantry_id,
+        hold_expires_at=datetime.utcnow() + timedelta(minutes=res.hold_minutes),
         qr_code=secrets.token_urlsafe(16),
     )
     db.add(db_res)
-    item.status = models.ItemStatus.RESERVED
+    db.commit()
+    db.refresh(db_res)
+    return db_res
+
+
+def list_reservations(
+    db: Session,
+    pantry_id: Optional[str] = None,
+    status: Optional[models.ReservationStatus] = None,
+):
+    """Newest first. `pantry_id` scopes the result to one organization —
+    the organizer dashboard always passes it, staff never do (FR-2.4)."""
+    q = db.query(models.Reservation)
+    if pantry_id:
+        q = q.filter(models.Reservation.pantry_id == pantry_id)
+    if status:
+        q = q.filter(models.Reservation.status == status)
+    return q.order_by(models.Reservation.reserved_at.desc()).all()
+
+
+def cancel_reservation(db: Session, reservation_id: str, pantry_id: str) -> Optional[models.Reservation]:
+    """
+    FR-8.11: an organization cancels its own pending reservation and the
+    item returns to the pool immediately.
+
+    A reservation belonging to another organization returns None, which the
+    router renders as 404 rather than 403 — a 403 would confirm that the
+    reservation exists (FR-2.4).
+    """
+    db_res = db.get(models.Reservation, reservation_id)
+    if not db_res or db_res.pantry_id != pantry_id:
+        return None
+    if db_res.status != models.ReservationStatus.PENDING:
+        return None
+
+    db_res.status = models.ReservationStatus.CANCELLED
+    item = db.get(models.Item, db_res.item_id)
+    if item:
+        item.status = models.ItemStatus.AVAILABLE
     db.commit()
     db.refresh(db_res)
     return db_res

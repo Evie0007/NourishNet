@@ -1,31 +1,40 @@
-import { Link, Route, Routes } from "react-router-dom";
-import Home from "./pages/Home";
-import StorePage from "./pages/StorePage";
-import PantryPage from "./pages/PantryPage";
+import { Navigate, Route, Routes } from "react-router-dom";
+import { AuthProvider, ProtectedRoute } from "./auth";
+import Login from "./pages/Login";
+import StaffDashboard from "./pages/StaffDashboard";
+import OrganizerDashboard from "./pages/OrganizerDashboard";
+
+const STORE_ROLES = ["staff", "manager", "admin"];
 
 function App() {
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900">
-      <nav className="flex items-center gap-6 border-b border-gray-200 bg-white px-6 py-4">
-        <Link to="/" className="font-semibold">
-          NourishNet
-        </Link>
-        <Link to="/store" className="text-sm text-gray-600 hover:text-gray-900">
-          Store view
-        </Link>
-        <Link to="/pantry" className="text-sm text-gray-600 hover:text-gray-900">
-          Pantry view
-        </Link>
-      </nav>
+    <AuthProvider>
+      <Routes>
+        {/* Welcome + sign in. Redirects to the right dashboard if already
+            signed in, so this doubles as the post-logout landing page. */}
+        <Route path="/" element={<Login />} />
 
-      <main className="mx-auto max-w-4xl px-6 py-8">
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/store" element={<StorePage />} />
-          <Route path="/pantry" element={<PantryPage />} />
-        </Routes>
-      </main>
-    </div>
+        <Route
+          path="/staff"
+          element={
+            <ProtectedRoute roles={STORE_ROLES}>
+              <StaffDashboard />
+            </ProtectedRoute>
+          }
+        />
+
+        <Route
+          path="/organizer"
+          element={
+            <ProtectedRoute roles={["org_coordinator"]}>
+              <OrganizerDashboard />
+            </ProtectedRoute>
+          }
+        />
+
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </AuthProvider>
   );
 }
 

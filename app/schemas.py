@@ -8,7 +8,35 @@ from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, EmailStr, ConfigDict
 
-from .models import ItemStatus, ReservationStatus
+from .models import ItemStatus, ReservationStatus, UserRole
+
+
+# ---------- Auth ----------
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class AuthUserOut(BaseModel):
+    """What the client needs to render the right dashboard (FR-1.10).
+    The pantry fields are flattened in so the organizer view can show its
+    org name and verification banner without a second request."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    email: EmailStr
+    full_name: Optional[str]
+    role: UserRole
+    pantry_id: Optional[str] = None
+    pantry_name: Optional[str] = None
+    pantry_verified: Optional[bool] = None
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+    user: AuthUserOut
 
 
 # ---------- Shelf ----------
@@ -104,8 +132,11 @@ class PantryOut(BaseModel):
 # ---------- Reservation ----------
 
 class ReservationCreate(BaseModel):
+    """Note the absence of pantry_id: FR-2.3 requires the acting
+    organization to come from the authenticated user's account, never from
+    the request body. Accepting it here would let any coordinator reserve
+    food in another organization's name."""
     item_id: str
-    pantry_id: str
     hold_minutes: int = 180  # default 3-hour holding window, per Section 13.3
 
 
@@ -119,3 +150,13 @@ class ReservationOut(BaseModel):
     hold_expires_at: datetime
     qr_code: Optional[str]
     picked_up_at: Optional[datetime]
+
+
+class ReservationDetailOut(ReservationOut):
+    """Reservation joined with the names both dashboards need to display,
+    so neither has to fetch the whole item list to label a row."""
+    item_name: Optional[str] = None
+    item_category: Optional[str] = None
+    item_sell_by_date: Optional[datetime] = None
+    shelf_name: Optional[str] = None
+    pantry_name: Optional[str] = None
