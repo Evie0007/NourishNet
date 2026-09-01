@@ -1,0 +1,12 @@
+# Vercel serves the React frontend only. The FastAPI app deploys to Render
+# (see render.yaml), and leaving requirements.txt visible here is what makes
+# Vercel misidentify this as a Python project and try to run app/ as a
+# serverless function — which then crashes on every request.
+app/
+scripts/
+docs/
+venv/
+.venv/
+requirements.txt
+render.yaml
+*.db
