@@ -45,6 +45,38 @@ async function request(path, options = {}) {
 const post = (path, data) =>
   request(path, { method: "POST", body: data === undefined ? undefined : JSON.stringify(data) });
 
+const patch = (path, data) =>
+  request(path, { method: "PATCH", body: JSON.stringify(data) });
+
+/**
+ * Multipart upload for the label photo. Deliberately not routed through
+ * `request`: that helper sets Content-Type to application/json, and a
+ * multipart body needs the browser to set it, boundary included. Setting
+ * it by hand produces a request the server cannot parse.
+ */
+async function postFile(path, file, field = "image") {
+  const token = getToken();
+  const body = new FormData();
+  body.append(field, file, file.name || "label.jpg");
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body,
+  });
+
+  if (res.status === 401) {
+    clearToken();
+    onUnauthorized();
+    throw new Error("Your session ended. Sign in again.");
+  }
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload.detail || `Upload failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export const api = {
   // ---- auth ----
   login: (email, password) => post("/auth/login", { email, password }),
@@ -64,6 +96,29 @@ export const api = {
     request(`/items/${itemId}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
   listNearExpiry: (withinHours = 48) => request(`/items/near-expiry?within_hours=${withinHours}`),
   submitOcrResult: (itemId, data) => post(`/items/${itemId}/ocr-result`, data),
+  // Manager-only. The scheduler runs this every minute on its own; this is
+  // for seeing the rules act without waiting for the next tick.
+  runExpirationSweep: () => post("/items/run-expiration-sweep"),
+
+  // ---- catalog (UPC scanner + expiration rules) ----
+  // A code nothing recognizes comes back 200 with product: null — an
+  // ordinary outcome at the dock, not an error to show the user.
+  lookupUpc: (upc) => request(`/catalog/upc/${encodeURIComponent(upc)}`),
+  listProducts: (search) =>
+    request(search ? `/catalog/products?search=${encodeURIComponent(search)}` : "/catalog/products"),
+  createProduct: (data) => post("/catalog/products", data),
+  listExpirationRules: () => request("/catalog/expiration-rules"),
+  updateExpirationRule: (id, data, recompute = false) =>
+    patch(`/catalog/expiration-rules/${id}?recompute=${recompute}`, data),
+
+  // ---- intake (UPC → OCR date → manual confirmation) ----
+  openScan: (data) => post("/intake/scans", data),
+  listScans: (status) =>
+    request(status ? `/intake/scans?status=${status}` : "/intake/scans"),
+  submitScanDate: (scanId, data) => post(`/intake/scans/${scanId}/date`, data),
+  submitScanImage: (scanId, file) => postFile(`/intake/scans/${scanId}/ocr-image`, file),
+  confirmScan: (scanId, data) => post(`/intake/scans/${scanId}/confirm`, data),
+  rejectScan: (scanId, notes) => post(`/intake/scans/${scanId}/reject`, { notes: notes || null }),
 
   // ---- pantries ----
   registerPantry: (data) => post("/pantries", data),

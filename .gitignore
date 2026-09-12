@@ -2,7 +2,11 @@ __pycache__/
 *.pyc
 .env
 gcp-vision-key.json
-nourishnet.db
 .venv/
 venv/
-nourishnet_local.db
+
+# SQLite dev databases, plus the -wal/-shm sidecars that WAL mode creates
+# alongside them (see the pragmas in backend/app/database.py).
+*.db
+*.db-wal
+*.db-shm

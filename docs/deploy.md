@@ -5,8 +5,12 @@ Two pieces, two hosts:
 | Piece | Host | Why |
 |---|---|---|
 | `frontend/` | Vercel | Static build, already there |
-| `app/` (API) | Render | Needs a long-lived process — for the expiry sweep, and so SQLAlchemy's connection pool isn't rebuilt per request |
+| `backend/` (API) | Render | Needs a long-lived process — for the expiration sweep, and so SQLAlchemy's connection pool isn't rebuilt per request |
 | Database | Supabase | Already running |
+
+Both hosts build from the same repo and each ignores the other's half:
+`render.yaml` sets `rootDir: backend`, and `.vercelignore` hides `backend/`
+so Vercel doesn't mistake the Python for a serverless function.
 
 ---
 
@@ -62,15 +66,26 @@ Render's free plan has no shell, so run the seed from your machine pointed at
 Supabase:
 
 ```powershell
+cd backend
 $env:DATABASE_URL="<the same Supabase URL>"
 $env:DEMO_STAFF_PASSWORD="<pick something long>"
 $env:DEMO_ORG_PASSWORD="<pick something long>"
-python -m scripts.seed_demo
+.\venv\Scripts\python.exe -m scripts.upgrade_schema   # first deploy of the intake pipeline only
+.\venv\Scripts\python.exe -m scripts.seed_demo
 ```
 
-This writes to the shared team database — the two demo users, a verified demo
-pantry, and sample shelves and items. Re-running updates rather than
-duplicates.
+Both run from `backend/`, which is where `app/` and `scripts/` live.
+
+`upgrade_schema` adds the intake tables and columns to a database that
+predates them, and backfills expiration deadlines onto existing items —
+without it, older stock has no deadlines and the sweep cannot see it. It is
+idempotent and a no-op once the database is current, and Render also runs it
+on every deploy via `preDeployCommand`, so this manual run matters only if
+you seed before the first deploy.
+
+`seed_demo` writes to the shared team database — the two demo users, a
+verified demo pantry, the default expiration rules, a small UPC catalog, and
+sample shelves and items. Re-running updates rather than duplicates.
 
 ## 4. Point Vercel at the API
 

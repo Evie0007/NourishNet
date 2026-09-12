@@ -15,7 +15,25 @@ services:
     # the round trip.
     region: oregon
 
+    # The Python app lives in backend/; the repo root holds this file, the
+    # React app, and the docs. Every command below runs inside this
+    # directory, which is why they still read as if backend/ were the root.
+    rootDir: backend
+
     buildCommand: pip install -r requirements.txt
+
+    # Brings an existing database up to the current schema before the app
+    # starts. `create_all` at startup adds missing tables but never a column
+    # to a table that already exists, so without this an older database
+    # serves its first request against columns that aren't there.
+    # Idempotent — a no-op once the database is current.
+    preDeployCommand: python -m scripts.upgrade_schema
+
+    # One worker. The expiration sweep runs inside the web process, and each
+    # worker would run its own copy: harmless (the sweep is idempotent) but
+    # pointless. Add workers and the sweeps multiply; move to a Render cron
+    # service running `python -m scripts.sweep` with SWEEP_ENABLED=false
+    # before scaling this out.
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
     # Render polls this to decide the deploy succeeded. Without it, a service
@@ -47,3 +65,17 @@ services:
         value: "8"
       - key: ORG_TOKEN_HOURS
         value: "24"
+
+      # The automatic expiration sweep (FR-10.2 asks for no more than five
+      # minutes between runs). Note the free plan spins a service down when
+      # idle — a sleeping service sweeps nothing, and catches up in one pass
+      # when the next request wakes it.
+      - key: SWEEP_ENABLED
+        value: "true"
+      - key: SWEEP_INTERVAL_SECONDS
+        value: "60"
+
+      # External UPC lookup for barcodes the catalog doesn't know. Off: the
+      # intake desk must not wait on a third-party API.
+      - key: UPC_LOOKUP_ENABLED
+        value: "false"

@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, parseUtc } from "../api";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
+import Intake from "./Intake";
 
 const TABS = [
   { key: "overview", label: "Overview" },
+  { key: "intake", label: "Intake" },
   { key: "review", label: "Review queue" },
   { key: "inventory", label: "Inventory" },
+  { key: "rules", label: "Expiration rules" },
   { key: "shelves", label: "Shelves" },
 ];
 
@@ -105,12 +108,14 @@ export default function StaffDashboard() {
               onChanged={refresh}
             />
           )}
+          {tab === "intake" && <Intake shelves={shelves} onError={setError} onChanged={refresh} />}
           {tab === "review" && (
             <ReviewQueue queue={reviewQueue} shelfName={shelfName} onError={setError} onChanged={refresh} />
           )}
           {tab === "inventory" && (
             <Inventory items={items} shelves={shelves} shelfName={shelfName} onError={setError} onChanged={refresh} />
           )}
+          {tab === "rules" && <ExpirationRules onError={setError} onChanged={refresh} />}
           {tab === "shelves" && <Shelves shelves={shelves} onError={setError} onChanged={refresh} />}
         </>
       )}
@@ -538,7 +543,11 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
                 <tr>
                   <th className="pb-2 pr-4 font-medium">Item</th>
                   <th className="pb-2 pr-4 font-medium">Shelf</th>
-                  <th className="pb-2 pr-4 font-medium">Sell-by</th>
+                  <th className="pb-2 pr-4 font-medium">Date</th>
+                  {/* What the scheduler will do next, and when. An automatic
+                      status change that nobody could see coming is the thing
+                      that makes staff stop trusting the automation. */}
+                  <th className="pb-2 pr-4 font-medium">Next automatic move</th>
                   <th className="pb-2 pr-4 font-medium">Status</th>
                   <th className="pb-2 font-medium"></th>
                 </tr>
@@ -551,10 +560,20 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
                       <div className="text-xs text-gray-500">
                         {item.category || "Uncategorized"}
                         {item.sku ? ` · ${item.sku}` : ""}
+                        {item.upc ? ` · UPC ${item.upc.replace(/^0/, "")}` : ""}
                       </div>
                     </td>
                     <td className="py-2 pr-4 text-gray-600">{shelfName(item.shelf_id)}</td>
-                    <td className="py-2 pr-4 text-gray-600">{formatDate(item.sell_by_date)}</td>
+                    <td className="py-2 pr-4 text-gray-600">
+                      {formatDate(item.use_by_date || item.sell_by_date)}
+                      <div className="text-xs text-gray-400">
+                        {item.use_by_date ? "use by" : item.sell_by_date ? "sell by" : "no date"}
+                        {item.date_source === "shelf_life" && " · estimated"}
+                      </div>
+                    </td>
+                    <td className="py-2 pr-4">
+                      <NextMove item={item} />
+                    </td>
                     <td className="py-2 pr-4">
                       <StatusBadge status={item.status} />
                     </td>
@@ -588,6 +607,54 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
       {import.meta.env.DEV && <OcrSimulator items={items} onError={onError} onChanged={onChanged} />}
     </div>
   );
+}
+
+/**
+ * The next thing the expiration sweep will do to this item.
+ *
+ * Terminal items have no next move. An item with no deadlines has none
+ * either, and that is worth saying out loud rather than leaving blank: a
+ * blank cell reads as "nothing due yet," when it actually means the sweep
+ * cannot see this item at all and it will sit there indefinitely.
+ */
+function NextMove({ item }) {
+  if (["picked_up", "discarded", "expired_hold"].includes(item.status)) {
+    return <span className="text-xs text-gray-400">—</span>;
+  }
+
+  const donate = parseUtc(item.donate_after);
+  const discard = parseUtc(item.discard_after);
+
+  if (!donate && !discard) {
+    return (
+      <span className="text-xs font-medium text-amber-700">
+        No date — won't move on its own
+      </span>
+    );
+  }
+
+  const publishable = ["in_stock", "near_expiry"].includes(item.status);
+  if (publishable && donate && donate.getTime() > Date.now()) {
+    return (
+      <span className="text-xs text-gray-600">
+        Offer to pantries {relativeTo(item.donate_after)}
+        <span className="block text-gray-400">{formatDate(item.donate_after)}</span>
+      </span>
+    );
+  }
+
+  if (discard) {
+    return (
+      <span className="text-xs text-gray-600">
+        Off the shelf {relativeTo(item.discard_after)}
+        <span className="block text-gray-400">{formatDate(item.discard_after)}</span>
+      </span>
+    );
+  }
+
+  // donate_after has passed but the status hasn't changed: either the
+  // category needs a person to publish it, or the sweep hasn't ticked yet.
+  return <span className="text-xs text-gray-500">Waiting on staff to publish</span>;
 }
 
 function OcrSimulator({ items, onError, onChanged }) {
@@ -637,6 +704,126 @@ function OcrSimulator({ items, onError, onChanged }) {
       </ul>
     </Card>
   );
+}
+
+/* ---------------- Expiration rules ---------------- */
+
+/**
+ * The policy behind every status change the system makes on its own.
+ *
+ * Read-only for staff, editable by a manager. It is here rather than
+ * buried in an admin screen for a specific reason: staff who cannot see
+ * why an item moved stop trusting that it moved for a reason, and start
+ * keeping their own list on paper.
+ */
+function ExpirationRules({ onError, onChanged }) {
+  const [rules, setRules] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [sweeping, setSweeping] = useState(false);
+  const [lastSweep, setLastSweep] = useState(null);
+
+  useEffect(() => {
+    api
+      .listExpirationRules()
+      .then(setRules)
+      .catch((err) => onError(err.message))
+      .finally(() => setLoading(false));
+  }, [onError]);
+
+  async function sweepNow() {
+    onError("");
+    setSweeping(true);
+    try {
+      setLastSweep(await api.runExpirationSweep());
+      onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setSweeping(false);
+    }
+  }
+
+  if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
+
+  return (
+    <div className="space-y-6">
+      <Card
+        title="Automatic expiration rules"
+        action={
+          <button onClick={sweepNow} disabled={sweeping} className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60">
+            {sweeping ? "Running…" : "Run the sweep now"}
+          </button>
+        }
+      >
+        <p className="mb-4 text-sm text-gray-600">
+          These numbers decide when an item is flagged, offered to the donation
+          network, and taken off the shelf. The server applies them every minute —
+          the button above just runs it early. Managers can edit them.
+        </p>
+
+        {lastSweep && (
+          <div className="mb-4 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+            Sweep finished: {lastSweep.near_expiry} flagged near expiry,{" "}
+            {lastSweep.published} published, {lastSweep.discarded} discarded,{" "}
+            {lastSweep.released_from_reserved} released from a lapsed hold,{" "}
+            {lastSweep.reservations_expired} reservation(s) expired.
+          </div>
+        )}
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="text-xs uppercase tracking-wide text-gray-500">
+              <tr>
+                <th className="pb-2 pr-4 font-medium">Category</th>
+                <th className="pb-2 pr-4 font-medium">Flag near expiry</th>
+                <th className="pb-2 pr-4 font-medium">Offer to pantries</th>
+                <th className="pb-2 pr-4 font-medium">Take off the shelf</th>
+                <th className="pb-2 font-medium">Publishes on its own</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {rules.map((rule) => (
+                <tr key={rule.id}>
+                  <td className="py-2 pr-4">
+                    <div className="font-medium">
+                      {rule.category === "*" ? "Everything else" : rule.category}
+                    </div>
+                    {rule.notes && <div className="text-xs text-gray-500">{rule.notes}</div>}
+                  </td>
+                  <td className="py-2 pr-4 text-gray-600">{offsetLabel(-rule.near_expiry_hours)}</td>
+                  <td className="py-2 pr-4 text-gray-600">{offsetLabel(rule.publish_offset_hours)}</td>
+                  <td className="py-2 pr-4 text-gray-600">
+                    {offsetLabel(rule.discard_after_hours)}
+                    <div className="text-xs text-gray-400">or the use-by date, whichever is first</div>
+                  </td>
+                  <td className="py-2">
+                    {rule.auto_publish ? (
+                      "Yes"
+                    ) : (
+                      <span className="font-medium text-amber-700">No — staff approve each one</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <p className="mt-4 text-xs text-gray-500">
+          All times are relative to the item's sell-by date. A use-by date always
+          wins: nothing is offered to a pantry past one, whatever the category says.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+/** "12h before" / "2d after" / "on the date" — hours are not a unit staff think in. */
+function offsetLabel(hours) {
+  if (hours === 0) return "on the date";
+  const abs = Math.abs(hours);
+  const amount = abs % 24 === 0 ? `${abs / 24}d` : `${abs}h`;
+  return hours < 0 ? `${amount} before` : `${amount} after`;
 }
 
 /* ---------------- Shelves (FR-3.7) ---------------- */

@@ -1,0 +1,18 @@
+# Development and test dependencies. Deliberately separate from
+# requirements.txt so Render doesn't install a test client into production.
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Pinned for the same reason as the runtime deps (NFR-4.1.8): an unpinned
+# test dependency means a test suite that passes today and fails tomorrow
+# for reasons unrelated to the code.
+
+# fastapi.testclient is a thin wrapper over starlette's, which drives the
+# app in-process over ASGI — no server to start, no port to pick. Recent
+# starlette wants httpx2 specifically and only warns on plain httpx.
+httpx2==2.12.0
+
+# For the test suite proper. Nothing uses this yet — "no tests" is still a
+# known gap in the README — but it is the obvious next thing and pinning it
+# here means the suite starts from a known-good version.
+pytest==9.1.1
