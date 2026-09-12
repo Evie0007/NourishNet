@@ -18,8 +18,9 @@ email-validator==2.3.0
 bcrypt==5.0.0
 pyjwt==2.13.0
 
-# OCR pipeline. Nothing imports app/ocr.py yet, so this is not needed at
-# runtime — it's the single largest thing in the build (grpcio, protobuf).
-# If Render builds get slow or memory-tight on the free plan, comment this
-# out; re-enable it when the Vision pipeline is actually wired in.
+# OCR pipeline. Load-bearing: app/routers/intake.py imports app/ocr.py, which
+# imports this inside the function that uses it. It is the single largest thing
+# in the build (grpcio, protobuf), but commenting it out now breaks the label
+# scanner — to save build weight, unset GOOGLE_APPLICATION_CREDENTIALS instead
+# and let label reads come back empty.
 google-cloud-vision==3.15.0

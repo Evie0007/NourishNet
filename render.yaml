@@ -90,7 +90,15 @@ services:
       - key: SWEEP_INTERVAL_SECONDS
         value: "60"
 
-      # External UPC lookup for barcodes the catalog doesn't know. Off: the
-      # intake desk must not wait on a third-party API.
+      # External UPC lookup (Open Food Facts) for barcodes the catalog doesn't
+      # know. The result is cached as a catalog row, so each unknown code costs
+      # one request ever. The intake desk never waits on the answer: every
+      # failure returns "no product", the same screen an unknown barcode gets.
       - key: UPC_LOOKUP_ENABLED
-        value: "false"
+        value: "true"
+
+      # How long to wait before giving up on that lookup. This is added to the
+      # response time of a scan for an unknown barcode while the service is
+      # down, so keep it short — staff are holding a can.
+      - key: UPC_LOOKUP_TIMEOUT_SECONDS
+        value: "3"

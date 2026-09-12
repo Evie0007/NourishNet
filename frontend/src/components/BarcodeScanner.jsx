@@ -17,6 +17,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * construction or support no formats, and a check that passes before
  * failing at the first frame is worse than no check.
  *
+ * Two ways to get a read, because donated food is not a checkout lane:
+ *
+ *  - Live decoding off the preview, for a flat box held steady.
+ *  - "Capture", which decodes one full-resolution still. A crinkled foil
+ *    bag under store lighting rarely offers a sharp frame at 5 fps, and
+ *    letting someone steady the shot and press a button beats asking them
+ *    to hold a curved package still for ten seconds.
+ *
  * Why this is separate from the label photo in Intake: that one takes a
  * still and sends it to the server for OCR, because reading a date needs
  * a real OCR engine. A barcode is decoded here in the browser, off the
@@ -36,15 +44,41 @@ const SCAN_INTERVAL_MS = 200;
 // in a row essentially cannot. The check digit catches the rest.
 const CONFIRMATIONS_REQUIRED = 2;
 
+// How long a scan goes quiet before the status line stops repeating itself
+// and starts suggesting what to change. Saying the same thing at second 1
+// and second 60 is how a person concludes the scanner is broken rather
+// than that they are holding it wrong.
+const COACH_AFTER_MS = 8000;
+
+// The aiming rectangle, normalized against the video frame.
+//
+// The box a person aims with and the box the decoder reads have to be the
+// same rectangle, or the guidance is a lie — which is what it was when
+// this was a CSS inset on an aria-hidden div and every frame went to the
+// decoder whole. Both the overlay and the crop derive from this constant.
+const AIM_BOX = { x: 0.1, y: 0.35, w: 0.8, h: 0.3 };
+
 export default function BarcodeScanner({ onDetected, onClose }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const stopRef = useRef(null);
+  // Two canvases, not one. The live loop redraws its own every 200ms while
+  // Capture is drawing five crops into the other; sharing one would mean a
+  // pending detect() reading a frame that had already been overwritten.
+  const canvasRef = useRef(null);
+  const captureCanvasRef = useRef(null);
+  const detectorRef = useRef(null);
+  const zxingReaderRef = useRef(null);
   const [status, setStatus] = useState("starting");
   const [message, setMessage] = useState("");
   const [devices, setDevices] = useState([]);
   const [deviceId, setDeviceId] = useState("");
   const [engine, setEngine] = useState("");
+  const [torchAvailable, setTorchAvailable] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const [coaching, setCoaching] = useState(false);
+  const [aimStyle, setAimStyle] = useState(null);
 
   // Held in a ref, not state: the decode loop reads it every frame, and a
   // state update per frame would re-render the component five times a
@@ -78,6 +112,8 @@ export default function BarcodeScanner({ onDetected, onClose }) {
     stopRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    detectorRef.current = null;
+    zxingReaderRef.current = null;
   }, []);
 
   // Enumerate cameras once permission exists. Before the user grants it,
@@ -130,15 +166,18 @@ export default function BarcodeScanner({ onDetected, onClose }) {
           await videoRef.current.play().catch(() => {});
         }
         setStatus("scanning");
+        setTorchOn(false);
         listCameras();
+        setTorchAvailable(await applyTrackTuning(stream.getVideoTracks()[0]));
 
         const detector = await makeNativeDetector();
         if (detector) {
+          detectorRef.current = detector;
           setEngine("browser");
-          stopRef.current = runNative(detector, videoRef, handleHit);
+          stopRef.current = runNative(detector, videoRef, canvasRef, handleHit);
         } else {
           setEngine("zxing");
-          stopRef.current = await runZxing(videoRef, stream, handleHit);
+          stopRef.current = await runZxing(videoRef, stream, zxingReaderRef, handleHit);
         }
       } catch (err) {
         if (cancelled) return;
@@ -154,6 +193,101 @@ export default function BarcodeScanner({ onDetected, onClose }) {
     };
   }, [deviceId, handleHit, listCameras, stop]);
 
+  // Keep the overlay glued to the picture. The <video> is object-contain
+  // inside a max-height box, so the element is letterboxed and an inset in
+  // element percentages lands somewhere else than the same percentage of
+  // the frame — badly so on a laptop, where the bars are worst.
+  useEffect(() => {
+    if (status !== "scanning") return undefined;
+
+    function reposition() {
+      const rect = aimOverlayRect(videoRef.current);
+      if (rect) setAimStyle(rect);
+    }
+
+    reposition();
+    const timer = setInterval(reposition, 500);
+    window.addEventListener("resize", reposition);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("resize", reposition);
+    };
+  }, [status]);
+
+  // Nudge after a silent stretch. Reset by an actual read, which only
+  // happens on the way out, so in practice this fires whenever someone is
+  // struggling and never when they aren't.
+  useEffect(() => {
+    if (status !== "scanning") return undefined;
+    const timer = setTimeout(() => setCoaching(true), COACH_AFTER_MS);
+    // Reset on the way out rather than on the way in, so switching cameras
+    // mid-struggle restarts the clock without a synchronous setState.
+    return () => {
+      clearTimeout(timer);
+      setCoaching(false);
+    };
+  }, [status, deviceId]);
+
+  async function toggleTorch() {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    const next = !torchOn;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: next }] });
+      setTorchOn(next);
+    } catch {
+      // Some devices advertise torch and then refuse it while streaming.
+      setTorchAvailable(false);
+    }
+  }
+
+  /**
+   * Decode one deliberately-steadied still.
+   *
+   * Accepts on a single read, unlike the live path's two. The two-read
+   * rule exists to defeat motion blur, and a full-resolution frame someone
+   * held still for has none by construction; the server's GS1 check digit
+   * is still the real guard. Demanding two captures would mean two button
+   * presses per package, which is the whole problem this solves.
+   */
+  async function captureStill() {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2 || finished.current) return;
+
+    setCapturing(true);
+    setMessage("");
+    try {
+      const attempts = [
+        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1),
+        // Upscaled with smoothing off: thin bars survive as hard edges
+        // rather than being averaged into grey, which both decoders need.
+        () => cropFrame(video, captureCanvasRef, AIM_BOX, 2),
+        // For someone who aimed badly rather than held badly.
+        () => cropFrame(video, captureCanvasRef, FULL_FRAME, 1),
+        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1, 90),
+        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1, 270),
+      ];
+
+      for (const build of attempts) {
+        const canvas = build();
+        if (!canvas) continue;
+        const code = await decodeCanvas(canvas, detectorRef.current, zxingReaderRef.current);
+        if (code) {
+          finished.current = true;
+          onDetected(String(code).replace(/\D/g, ""));
+          return;
+        }
+      }
+
+      setMessage(
+        "Couldn't read that one. Flatten the package so the bars aren't curved, " +
+          "fill the white box, and try again — or type the digits under the barcode.",
+      );
+    } finally {
+      setCapturing(false);
+    }
+  }
+
   return (
     <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-3">
       <div className="relative overflow-hidden rounded-lg bg-black">
@@ -167,28 +301,61 @@ export default function BarcodeScanner({ onDetected, onClose }) {
           className="block max-h-80 w-full object-contain"
         />
         {/* Aiming guide. A webcam's autofocus hunts on a plain background,
-            so giving people a box to fill is most of the battle. */}
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-[10%] inset-y-[35%] rounded-lg border-2 border-white/70"
-        />
+            so giving people a box to fill is most of the battle — and this
+            box is the rectangle actually handed to the decoder. */}
+        {aimStyle && (
+          <div
+            aria-hidden="true"
+            style={aimStyle}
+            className="pointer-events-none absolute rounded-lg border-2 border-white/70"
+          />
+        )}
       </div>
 
       <div role="status" aria-live="polite" className="mt-2 text-xs text-gray-600">
         {status === "starting" && "Waiting for the camera…"}
-        {status === "scanning" && (
-          <>
-            Fill the white box with the barcode, hold steady, and give it good
-            light.{" "}
-            <span className="text-gray-400">
-              ({engine === "browser" ? "browser decoder" : "ZXing"})
+        {status === "scanning" &&
+          (coaching ? (
+            <span className="text-gray-700">
+              Still looking. Move closer so the barcode fills the white box, flatten
+              any curve in the package, add light — or hold it steady and press
+              Capture.
             </span>
-          </>
-        )}
+          ) : (
+            <>
+              Fill the white box with the barcode, hold steady, and give it good
+              light.{" "}
+              <span className="text-gray-400">
+                ({engine === "browser" ? "browser decoder" : "ZXing"})
+              </span>
+            </>
+          ))}
         {status === "error" && <span className="font-medium text-amber-800">{message}</span>}
       </div>
 
+      {status === "scanning" && message && (
+        <p className="mt-1 text-xs font-medium text-amber-800">{message}</p>
+      )}
+
       <div className="mt-3 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={captureStill}
+          disabled={status !== "scanning" || capturing}
+          className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {capturing ? "Reading…" : "Capture"}
+        </button>
+        {torchAvailable && (
+          <button
+            type="button"
+            onClick={toggleTorch}
+            aria-pressed={torchOn}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            {torchOn ? "Light off" : "Light on"}
+          </button>
+        )}
         {devices.length > 1 && (
           <select
             value={deviceId}
@@ -220,6 +387,116 @@ export default function BarcodeScanner({ onDetected, onClose }) {
   );
 }
 
+/* ---------------- framing ---------------- */
+
+const FULL_FRAME = { x: 0, y: 0, w: 1, h: 1 };
+
+/**
+ * Where the aiming box belongs on screen, in pixels relative to the
+ * wrapper.
+ *
+ * `object-contain` letterboxes: the picture is centred inside the element
+ * with bars on two sides. Positioning the overlay against the element
+ * would put it over the bars on a laptop, where the 16:9 stream sits in a
+ * much wider box. This finds the picture first, then applies AIM_BOX to
+ * it, so the overlay and the crop are the same rectangle by construction.
+ */
+function aimOverlayRect(video) {
+  if (!video || !video.videoWidth || !video.clientWidth) return null;
+
+  const scale = Math.min(
+    video.clientWidth / video.videoWidth,
+    video.clientHeight / video.videoHeight,
+  );
+  const shownW = video.videoWidth * scale;
+  const shownH = video.videoHeight * scale;
+  const offsetX = (video.clientWidth - shownW) / 2;
+  const offsetY = (video.clientHeight - shownH) / 2;
+
+  return {
+    left: `${offsetX + shownW * AIM_BOX.x}px`,
+    top: `${offsetY + shownH * AIM_BOX.y}px`,
+    width: `${shownW * AIM_BOX.w}px`,
+    height: `${shownH * AIM_BOX.h}px`,
+  };
+}
+
+/**
+ * Draw a normalized sub-rectangle of the frame onto a canvas, in intrinsic
+ * pixels, optionally scaled and rotated.
+ *
+ * The canvas is reused across calls rather than allocated per tick: this
+ * runs five times a second for as long as the preview is open.
+ */
+function cropFrame(video, canvasRef, box, scale = 1, rotation = 0) {
+  const fw = video.videoWidth;
+  const fh = video.videoHeight;
+  if (!fw || !fh) return null;
+
+  const sx = Math.round(fw * box.x);
+  const sy = Math.round(fh * box.y);
+  const sw = Math.round(fw * box.w);
+  const sh = Math.round(fh * box.h);
+  if (sw < 1 || sh < 1) return null;
+
+  const dw = Math.round(sw * scale);
+  const dh = Math.round(sh * scale);
+  const swapped = rotation === 90 || rotation === 270;
+
+  const canvas = (canvasRef.current ||= document.createElement("canvas"));
+  canvas.width = swapped ? dh : dw;
+  canvas.height = swapped ? dw : dh;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Smoothing averages a thin bar into the space beside it. Off, an
+  // upscale keeps the edges the decoder is looking for.
+  ctx.imageSmoothingEnabled = false;
+
+  if (rotation) {
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate((rotation * Math.PI) / 180);
+    ctx.translate(-dw / 2, -dh / 2);
+  }
+
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return canvas;
+}
+
+/**
+ * Ask the camera for continuous focus, and report whether it has a torch.
+ *
+ * Both are best-effort. `getCapabilities` doesn't exist on Firefox or
+ * older Safari at all, and some devices advertise a capability and then
+ * reject the constraint — neither is a reason to fail the scan, so every
+ * step swallows its own error.
+ */
+async function applyTrackTuning(track) {
+  if (!track?.getCapabilities) return false;
+
+  let capabilities;
+  try {
+    capabilities = track.getCapabilities();
+  } catch {
+    return false;
+  }
+
+  // A fixed-focus laptop webcam ignores this; a phone held 15cm from a bag
+  // very much does not.
+  if (capabilities.focusMode?.includes?.("continuous")) {
+    try {
+      await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    } catch {
+      // Focus stays wherever the driver put it.
+    }
+  }
+
+  return capabilities.torch === true;
+}
+
 /* ---------------- decoders ---------------- */
 
 /**
@@ -240,19 +517,57 @@ async function makeNativeDetector() {
   }
 }
 
-/** Poll frames through the native detector. Returns a stop function. */
-function runNative(detector, videoRef, onHit) {
+/** Run one canvas past whichever decoder is live. Returns digits or null. */
+async function decodeCanvas(canvas, detector, zxingReader) {
+  if (detector) {
+    try {
+      const found = await detector.detect(canvas);
+      if (found.length > 0) return found[0].rawValue;
+    } catch {
+      // Fall through: an unreadable crop is the expected case here.
+    }
+    return null;
+  }
+
+  if (zxingReader) {
+    try {
+      return zxingReader.decodeFromCanvas(canvas)?.getText() ?? null;
+    } catch {
+      // ZXing throws NotFoundException for "no barcode", which is not an
+      // error condition when we are trying five crops in a row.
+    }
+  }
+  return null;
+}
+
+/**
+ * Poll frames through the native detector. Returns a stop function.
+ *
+ * Only the aiming box is handed over. Searching a whole 1080p frame for a
+ * symbol covering a tenth of it is both slower and less reliable than
+ * searching the region the person was told to aim with.
+ */
+function runNative(detector, videoRef, canvasRef, onHit) {
   let stopped = false;
+  // detect() is async and the canvas is reused, so a tick that overruns
+  // the interval would have its frame redrawn underneath it. Skipping the
+  // tick is right anyway: a backlog of stale frames helps nobody.
+  let inFlight = false;
 
   const timer = setInterval(async () => {
     const video = videoRef.current;
     // readyState < 2 means there is no frame yet; detect() on one throws.
-    if (stopped || !video || video.readyState < 2) return;
+    if (stopped || inFlight || !video || video.readyState < 2) return;
+    inFlight = true;
     try {
-      const found = await detector.detect(video);
+      const canvas = cropFrame(video, canvasRef, AIM_BOX, 1);
+      if (!canvas) return;
+      const found = await detector.detect(canvas);
       if (found.length > 0) onHit(found[0].rawValue);
     } catch {
       // A dropped frame is normal — the next tick tries again.
+    } finally {
+      inFlight = false;
     }
   }, SCAN_INTERVAL_MS);
 
@@ -268,8 +583,12 @@ function runNative(detector, videoRef, onHit) {
  * Restricted to the retail 1D formats for the same reason as the native
  * path, and because ZXing gets materially faster when it isn't trying
  * every symbology on every frame.
+ *
+ * The live path streams the whole element — `decodeFromStream` owns the
+ * video and can't be given a crop — so ZXing browsers get the aiming box
+ * on the Capture path instead, via the reader stashed in `readerRef`.
  */
-async function runZxing(videoRef, stream, onHit) {
+async function runZxing(videoRef, stream, readerRef, onHit) {
   // The dynamic import above gives React time to unmount underneath us —
   // 400KB is a slow first load on a store network. Without this guard
   // ZXing is handed a null element and throws where the user sees it.
@@ -290,11 +609,15 @@ async function runZxing(videoRef, stream, onHit) {
         BarcodeFormat.EAN_8,
       ],
     ],
+    // More scan lines per pass. Worth the CPU on a curved package, where
+    // the row through the middle is the one most likely to be distorted.
+    [DecodeHintType.TRY_HARDER, true],
   ]);
 
   const reader = new BrowserMultiFormatOneDReader(hints, {
     delayBetweenScanAttempts: SCAN_INTERVAL_MS,
   });
+  readerRef.current = reader;
 
   const controls = await reader.decodeFromStream(stream, videoRef.current, (result) => {
     if (result) onHit(result.getText());

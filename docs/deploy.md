@@ -51,6 +51,10 @@ pooler one, so copy it as-is.
 slash, no path. `https://nourishnet.vercel.app/` (trailing slash) will not
 match and every request from the browser will fail.
 
+Everything else in `render.yaml` is set for you, including
+`UPC_LOOKUP_ENABLED=true` — see [Barcode lookup](#barcode-lookup) below for what
+that turns on and when you'd want it off.
+
 4. Deploy. First boot runs `Base.metadata.create_all`, which creates the
    `users` table in Supabase. Existing tables are left alone.
 
@@ -118,6 +122,43 @@ button spins and fails, open DevTools → Network:
 
 ---
 
+## Barcode lookup
+
+`UPC_LOOKUP_ENABLED=true` lets the intake desk name a product from its barcode
+alone. A scan resolves in this order:
+
+1. **Your own catalog.** A `products` row matching the normalized GTIN-13.
+2. **Open Food Facts**, if the catalog misses. Anything it returns is written
+   to the catalog as a product with `source="external"`.
+3. **A person**, if neither knows it. They type the name, and that becomes a
+   catalog row too.
+
+So an unknown barcode costs one outbound request *ever*. The second unit off
+the same pallet — and every one after it — resolves from your own database,
+instantly and offline. The catalog gets better the more you receive.
+
+**Intake never waits on step 2 to succeed.** A miss, a timeout, a malformed
+response, and Open Food Facts being down all return the same thing: no product,
+which is exactly the screen staff get for a barcode nobody has ever seen. The
+only cost of an outage is `UPC_LOOKUP_TIMEOUT_SECONDS` (3) added to the first
+scan of each unknown code. Nothing is ever rejected for want of a lookup.
+
+Verify it against a real product once deployed:
+
+```bash
+curl -H "Authorization: Bearer <staff token>" \
+  https://<your-service>.onrender.com/catalog/upc/757528054069
+```
+
+Expect `"product"` populated with a name and brand, and `"newly_cached": true`
+on the first call, `false` on the second — that second `false` is the cache
+working.
+
+Turn it off (`UPC_LOOKUP_ENABLED=false`) only if you need intake to make no
+outbound calls at all. Staff can still receive everything; they just type more
+names. Note that Open Food Facts is crowd-sourced, so a returned name is a
+starting point staff can correct on the confirmation screen, not gospel.
+
 ## Known constraints
 
 **Free services sleep.** After 15 minutes idle, Render spins the service down;
@@ -134,7 +175,10 @@ the manager token as a repo secret.
 existing ones. The next time a column changes, it must be applied to Supabase
 by hand — or Alembic adopted first (C-5).
 
-**Build time.** `google-cloud-vision` is the largest dependency and nothing
-imports it yet. If builds get slow or hit the free plan's memory ceiling,
-comment it out of `requirements.txt`; re-enable when the Vision pipeline is
-actually wired in.
+**Build time.** `google-cloud-vision` is the largest dependency. It used to be
+safe to comment out of `requirements.txt` to speed up a slow build — that is no
+longer true: `app/routers/intake.py` imports `app/ocr.py`, so removing it now
+breaks label scanning at import time. If builds hit the free plan's memory
+ceiling, drop the *credentials* instead (unset `GOOGLE_APPLICATION_CREDENTIALS`)
+— label reads then come back empty and staff type the date, which the intake
+screen already handles.
