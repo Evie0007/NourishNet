@@ -20,7 +20,24 @@ from datetime import datetime, timedelta
 
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
-from app import models
+from app import expiration, models, upc as upc_lib
+
+# Real, check-digit-valid barcodes so the intake scanner can be demonstrated
+# by typing one of these into the UPC field. They are ordinary retail codes;
+# the names are ours, since the point is exercising the pipeline rather than
+# claiming anything about a real product.
+DEMO_PRODUCTS = [
+    # upc,            name,                   category,   shelf life, restricted
+    ("036000291452", "Whole Milk, 1 gal",      "Dairy",     7,  False),
+    ("038000356216", "Greek Yogurt 6-pack",    "Dairy",    14,  False),
+    ("041196910759", "Sourdough Loaf",         "Bakery",    3,  False),
+    ("028400157155", "Blueberry Muffins 4ct",  "Bakery",    4,  False),
+    ("681131022217", "Baby Spinach 5oz",       "Produce",   5,  False),
+    ("073731000106", "Cheddar Block 8oz",      "Dairy",    60,  False),
+    # Never auto-published, whatever the read looked like (NFR-4.8.6). Worth
+    # having in the demo: it is the case where the automation declines to act.
+    ("300871239609", "Infant Formula 12.4oz",  "Infant",  365,  True),
+]
 
 STAFF_EMAIL = os.getenv("DEMO_STAFF_EMAIL", "nourishnet26+staff@gmail.com")
 ORG_EMAIL = os.getenv("DEMO_ORG_EMAIL", "nourishnet26+organizer@gmail.com")
@@ -68,6 +85,30 @@ def main():
     db = SessionLocal()
 
     try:
+        # The expiration policy has to exist before any item does: without a
+        # rule, an item gets no deadlines, and no deadlines means the sweep
+        # cannot see it. Idempotent, and it never overwrites a manager's edits.
+        print("Expiration rules:")
+        print(f"  seeded: {expiration.ensure_default_rules(db)} new rule(s)")
+
+        print("UPC catalog:")
+        for upc, name, category, shelf_life, restricted in DEMO_PRODUCTS:
+            # Through the same normalizer the scanner uses, so a seeded row
+            # is stored exactly as a scan of the same code would store it —
+            # and so a typo in the table above fails here rather than
+            # silently creating a product no scan will ever match.
+            code = upc_lib.normalize(upc)
+            product = db.query(models.Product).filter(models.Product.upc == code).first()
+            if product is None:
+                product = models.Product(upc=code, source="catalog")
+                db.add(product)
+            product.name = name
+            product.category = category
+            product.default_shelf_life_days = shelf_life
+            product.donation_restricted = restricted
+        db.flush()
+        print(f"  {len(DEMO_PRODUCTS)} products (scan any of these at the intake desk)")
+
         print("Pantry:")
         pantry = (
             db.query(models.Pantry)
@@ -130,26 +171,36 @@ def main():
             shelves[1].last_reading_at = now - timedelta(minutes=4)
 
             items = [
+                # name,                  sku,         category, shelf, status,                    +hours, upc
                 # Already in the donation pool — the organizer sees these.
-                ("Whole Milk, 1 gal", "DAIRY-001", "Dairy", 0, models.ItemStatus.AVAILABLE, 12),
-                ("Greek Yogurt 6-pack", "DAIRY-014", "Dairy", 0, models.ItemStatus.AVAILABLE, 20),
-                ("Sourdough Loaf", "BAKE-003", "Bakery", 1, models.ItemStatus.AVAILABLE, 8),
+                ("Whole Milk, 1 gal",    "DAIRY-001", "Dairy",  0, models.ItemStatus.AVAILABLE,     12, "036000291452"),
+                ("Greek Yogurt 6-pack",  "DAIRY-014", "Dairy",  0, models.ItemStatus.AVAILABLE,     20, "038000356216"),
+                ("Sourdough Loaf",       "BAKE-003",  "Bakery", 1, models.ItemStatus.AVAILABLE,      8, "041196910759"),
                 # Waiting on staff review — the staff review queue.
-                ("Sliced Turkey 12oz", None, "Deli", 0, models.ItemStatus.NEEDS_REVIEW, 30),
-                ("Blueberry Muffins 4ct", "BAKE-021", "Bakery", 1, models.ItemStatus.NEEDS_REVIEW, 16),
-                # Approaching sell-by — the near-expiry panel.
-                ("Baby Spinach 5oz", "PROD-118", "Produce", 2, models.ItemStatus.IN_STOCK, 26),
-                ("Strawberries 1lb", "PROD-092", "Produce", 2, models.ItemStatus.IN_STOCK, 40),
-                ("Cheddar Block 8oz", "DAIRY-077", "Dairy", 0, models.ItemStatus.IN_STOCK, 400),
+                ("Sliced Turkey 12oz",   None,        "Deli",   0, models.ItemStatus.NEEDS_REVIEW,  30, None),
+                ("Blueberry Muffins 4ct","BAKE-021",  "Bakery", 1, models.ItemStatus.NEEDS_REVIEW,  16, "028400157155"),
+                # Approaching sell-by — the near-expiry panel. The sweep will
+                # walk these forward on its own within a minute of starting up,
+                # which is the point of seeding them here.
+                ("Baby Spinach 5oz",     "PROD-118",  "Produce",2, models.ItemStatus.IN_STOCK,      26, "681131022217"),
+                ("Strawberries 1lb",     "PROD-092",  "Produce",2, models.ItemStatus.IN_STOCK,      40, None),
+                ("Cheddar Block 8oz",    "DAIRY-077", "Dairy",  0, models.ItemStatus.IN_STOCK,     400, "073731000106"),
             ]
-            for name, sku, category, shelf_idx, item_status, hours in items:
+            rules = expiration.load_rules(db)
+            for name, sku, category, shelf_idx, item_status, hours, upc in items:
+                code = upc_lib.normalize(upc) if upc else None
+                product = upc_lib.find_product(db, code) if code else None
                 item = models.Item(
                     name=name,
                     sku=sku,
+                    upc=code,
+                    product_id=product.id if product else None,
                     category=category,
                     shelf_id=shelves[shelf_idx].id,
                     status=item_status,
                     sell_by_date=now + timedelta(hours=hours),
+                    date_label_type=models.DateLabelType.SELL_BY,
+                    date_source=models.DateSource.MANUAL,
                     arrival_date=now - timedelta(days=2),
                 )
                 if item_status == models.ItemStatus.NEEDS_REVIEW:
@@ -160,8 +211,52 @@ def main():
                     item.ocr_raw_text = f"SELL BY {(now + timedelta(hours=hours)).strftime('%m/%d/%Y')}"
                     item.ocr_confidence = 0.82 if sku is None else 0.97
                     item.sku_match_confirmed = False
+                    item.date_source = models.DateSource.OCR
+                # Without deadlines an item is invisible to the sweep, so a
+                # seeded one would sit still while scanned stock moved around
+                # it — and the demo would look broken for the wrong reason.
+                expiration.apply_rules_to_item(db, item, rules=rules)
                 db.add(item)
             print(f"  created: {len(shelves)} shelves, {len(items)} items")
+
+            # One scan left mid-flow, so the Intake tab has something in its
+            # confirmation queue on first load: a barcode that resolved, a
+            # date read below the confidence threshold, and a second date on
+            # the label to choose between.
+            sell_by = now + timedelta(hours=18)
+            milk = upc_lib.find_product(db, upc_lib.normalize("036000291452"))
+            db.add(
+                models.IntakeScan(
+                    upc=milk.upc,
+                    product_id=milk.id,
+                    shelf_id=shelves[0].id,
+                    quantity=4,
+                    ocr_raw_text=(
+                        f"GRADE A WHOLE MILK\nPKD {(now - timedelta(days=3)).strftime('%m/%d/%y')}\n"
+                        f"SELL BY {sell_by.strftime('%m/%d/%y')}"
+                    ),
+                    ocr_confidence=0.93,
+                    date_confidence=0.71,
+                    detected_date=sell_by,
+                    detected_label_type=models.DateLabelType.SELL_BY,
+                    date_candidates=[
+                        {
+                            "text": (now - timedelta(days=3)).strftime("%m/%d/%y"),
+                            "date": (now - timedelta(days=3)).isoformat(),
+                            "label_type": "packed_on",
+                            "confidence": 0.88,
+                        },
+                        {
+                            "text": sell_by.strftime("%m/%d/%y"),
+                            "date": sell_by.isoformat(),
+                            "label_type": "sell_by",
+                            "confidence": 0.71,
+                        },
+                    ],
+                    status=models.ScanStatus.PENDING,
+                )
+            )
+            print("  created: 1 intake scan waiting on confirmation")
         else:
             print("Sample inventory: skipped (shelves already exist)")
 

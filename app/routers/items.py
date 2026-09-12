@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import auth, crud, models, schemas
+from .. import auth, crud, models, schemas, scheduler, upc as upc_lib
 from ..database import get_db
 
 router = APIRouter(prefix="/items", tags=["items"])
@@ -15,7 +15,18 @@ def add_item(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    return crud.create_item(db, item)
+    """
+    Create an item directly, bypassing the intake station.
+
+    Kept for stock that never crossed a scanner — a correction, a backfill,
+    a partner drop-off. Routine receiving should go through
+    `POST /intake/scans`, which records what the scanners saw and who
+    confirmed it.
+    """
+    try:
+        return crud.create_item(db, item)
+    except upc_lib.InvalidBarcode as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("", response_model=list[schemas.ItemOut])
@@ -43,6 +54,24 @@ def near_expiry(
 ):
     """Items whose sell-by date is within `within_hours` from now."""
     return crud.list_near_expiry(db, within_hours=within_hours)
+
+
+@router.post("/run-expiration-sweep", response_model=schemas.SweepResultOut)
+def run_expiration_sweep(
+    user: models.User = Depends(auth.require_role(models.UserRole.MANAGER)),
+):
+    """
+    Run the automatic rules now instead of waiting for the next tick.
+
+    The scheduler already does this every minute; this exists for
+    demonstrating the rules and for the case where the sweep has been
+    turned off in favour of an external scheduler. Manager-only (FR-10.5)
+    — it changes item statuses in bulk.
+
+    Uses its own session rather than the request's, so the sweep's
+    transaction is not entangled with request teardown.
+    """
+    return scheduler.run_once()
 
 
 @router.get("/{item_id}", response_model=schemas.ItemOut)
