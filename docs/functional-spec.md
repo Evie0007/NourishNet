@@ -100,7 +100,7 @@ NourishNet reduces grocery-retail food waste by automating the path from "this i
 | ◐ **Partial** | Some of the behavior exists; the requirement describes the complete target. |
 | ○ **Proposed** | No implementation exists. |
 
-**Code citations** are relative to the repository root (`nourishnet-backend/`) and name the file and line range.
+**Code citations** name the file and line range. Paths are relative to `backend/` for Python and to the repository root otherwise — so `app/crud.py` is `backend/app/crud.py` on disk, and `frontend/src/api.js` is exactly that. Citations written before the backend/frontend split still read `app/…` and remain correct under that convention.
 
 ---
 

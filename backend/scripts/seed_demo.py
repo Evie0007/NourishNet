@@ -2,7 +2,7 @@
 Seeds the two demo accounts for the testing phase, plus enough shelf and
 item data that both dashboards have something to show.
 
-Run from the repo root:
+Run from backend/, where app/ and scripts/ live:
 
     # PowerShell
     $env:DEMO_STAFF_PASSWORD="..."; $env:DEMO_ORG_PASSWORD="..."

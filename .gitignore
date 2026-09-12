@@ -6,7 +6,7 @@ gcp-vision-key.json
 venv/
 
 # SQLite dev databases, plus the -wal/-shm sidecars that WAL mode creates
-# alongside them (see the pragmas in app/database.py).
+# alongside them (see the pragmas in backend/app/database.py).
 *.db
 *.db-wal
 *.db-shm

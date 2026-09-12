@@ -10,21 +10,32 @@ OCR date reader, confirmation step, and expiration rules fit together.
 
 ## Layout
 
+The two halves are siblings and deploy to different hosts. Everything Python
+is under `backend/`; everything the browser runs is under `frontend/`.
+
 ```
-app/               FastAPI backend
-  auth.py          password hashing, JWT, role guards
-  crud.py          business logic (intake, confidence branch, hold window, reservations)
-  database.py      engine + session (PostgreSQL; SQLite for local dev)
-  expiration.py    the automatic expiration rules and the sweep that applies them
-  models.py        SQLAlchemy schema
-  ocr.py           OCR date scanner — Vision call, date parsing, per-date confidence
-  scheduler.py     background loop that runs the sweep every minute
-  upc.py           UPC/EAN normalization, check digits, catalog resolution
-  routers/         HTTP endpoints
-frontend/          React 19 + Vite + Tailwind
-  src/pages/       Login, StaffDashboard, Intake, OrganizerDashboard
-scripts/           seed_demo.py, upgrade_schema.py, sweep.py
+backend/                FastAPI — deploys to Render (render.yaml: rootDir)
+  app/
+    auth.py             password hashing, JWT, role guards
+    crud.py             business logic (intake, confidence branch, hold window, reservations)
+    database.py         engine + session (PostgreSQL; SQLite for local dev)
+    expiration.py       the automatic expiration rules and the sweep that applies them
+    models.py           SQLAlchemy schema
+    ocr.py              OCR date scanner — Vision call, date parsing, per-date confidence
+    scheduler.py        background loop that runs the sweep every minute
+    upc.py              UPC/EAN normalization, check digits, catalog resolution
+    routers/            HTTP endpoints
+  scripts/              seed_demo.py, upgrade_schema.py, sweep.py, demo_expiration.py
+  requirements.txt
+  venv/                 local only, gitignored
+frontend/               React 19 + Vite + Tailwind — deploys to Vercel
+  src/pages/            Login, StaffDashboard, Intake, OrganizerDashboard
+  src/components/       Shell, BarcodeScanner
+docs/                   spec, deploy guide, intake pipeline
 ```
+
+Backend commands run from `backend/`; frontend commands from `frontend/`.
+Nothing runs from the repo root except git.
 
 ## The three screens
 
@@ -82,6 +93,7 @@ day or more — which makes the one part of the system that runs unattended also
 the part nobody ever watches run.
 
 ```bash
+cd backend
 python -m scripts.demo_expiration
 ```
 
@@ -93,16 +105,26 @@ clock. Uses a throwaway SQLite file so it can't touch the team database — pass
 
 ## Running it locally
 
-**Backend**
+Two terminals, one per half.
 
-```bash
+**Backend** — from `backend/`
+
+```powershell
+cd backend
 python -m venv venv
-venv\Scripts\activate          # PowerShell:  .\venv\Scripts\Activate.ps1
+.\venv\Scripts\Activate.ps1                        # bash: source venv/Scripts/activate
 pip install -r requirements.txt
 
-cp .env.example .env           # then fill in DATABASE_URL and JWT_SECRET
-python -m scripts.upgrade_schema   # only needed for a database that predates the intake tables
+copy .env.example .env                             # then fill in DATABASE_URL and JWT_SECRET
+python -m scripts.upgrade_schema                   # only for a database predating the intake tables
 python -m uvicorn app.main:app --reload
+```
+
+If activating the venv is blocked by PowerShell's execution policy, skip it
+and call the interpreter directly — every command below works the same way:
+
+```powershell
+.\venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
 API docs at http://localhost:8000/docs.
@@ -136,7 +158,7 @@ older stock has no deadlines and is invisible to the sweep. Idempotent, and a
 no-op on a database that is already current. Render runs it automatically via
 `preDeployCommand`.
 
-**Frontend**
+**Frontend** — from `frontend/`, in a second terminal
 
 ```bash
 cd frontend
@@ -152,6 +174,7 @@ The testing-phase accounts are created by the seed script. Passwords come from
 the environment — this repo is public, so nothing is hardcoded.
 
 ```powershell
+cd backend
 $env:DEMO_STAFF_PASSWORD="<pick something long>"
 $env:DEMO_ORG_PASSWORD="<pick something long>"
 python -m scripts.seed_demo

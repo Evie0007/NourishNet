@@ -2,11 +2,10 @@
 # (see render.yaml), and leaving requirements.txt visible here is what makes
 # Vercel misidentify this as a Python project and try to run app/ as a
 # serverless function — which then crashes on every request.
-app/
-scripts/
+#
+# One directory now covers what used to be four separate entries, which is
+# the practical argument for the backend/ + frontend/ split: a new Python
+# file can no longer land somewhere this file forgot to mention.
+backend/
 docs/
-venv/
-.venv/
-requirements.txt
-render.yaml
 *.db
