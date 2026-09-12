@@ -18,15 +18,30 @@ services:
     # The Python app lives in backend/; the repo root holds this file, the
     # React app, and the docs. Every command below runs inside this
     # directory, which is why they still read as if backend/ were the root.
+    #
+    # NOTE for an ALREADY-EXISTING service: Render does not re-apply this
+    # from the blueprint. It is read when a service is created, after which
+    # the dashboard's own Root Directory setting is what counts. Changing it
+    # here changes nothing on a live service — set Settings → Root Directory
+    # to `backend` in the dashboard, or the build runs at the repo root and
+    # fails on a requirements.txt that is no longer there.
     rootDir: backend
 
     buildCommand: pip install -r requirements.txt
 
     # Brings an existing database up to the current schema before the app
-    # starts. `create_all` at startup adds missing tables but never a column
-    # to a table that already exists, so without this an older database
-    # serves its first request against columns that aren't there.
-    # Idempotent — a no-op once the database is current.
+    # starts: `create_all` adds missing tables but never a column to a table
+    # that already exists, so without this an older database serves its first
+    # request against columns that aren't there. Idempotent.
+    #
+    # NOT AVAILABLE ON THE FREE PLAN — pre-deploy commands need a paid
+    # instance type. While `plan: free` above is in effect, this line does
+    # nothing and the migration is a manual step:
+    #
+    #     cd backend && python -m scripts.upgrade_schema
+    #
+    # Run it against the production DATABASE_URL before the first deploy of
+    # a schema change, or the API starts up and 500s on every item query.
     preDeployCommand: python -m scripts.upgrade_schema
 
     # One worker. The expiration sweep runs inside the web process, and each

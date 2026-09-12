@@ -155,8 +155,13 @@ python -m scripts.upgrade_schema
 It adds the new columns and indexes, seeds the expiration rules, and backfills
 `donate_after` / `discard_after` onto existing items — without that backfill,
 older stock has no deadlines and is invisible to the sweep. Idempotent, and a
-no-op on a database that is already current. Render runs it automatically via
-`preDeployCommand`.
+no-op on a database that is already current.
+
+**Run it against production yourself before deploying a schema change.**
+`render.yaml` declares it as a `preDeployCommand`, but pre-deploy commands
+require a paid Render instance type and this service is on the free plan, so
+that line does nothing today. Deploying without having run it means the API
+boots and then 500s on every item query.
 
 **Frontend** — from `frontend/`, in a second terminal
 

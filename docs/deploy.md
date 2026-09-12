@@ -79,9 +79,14 @@ Both run from `backend/`, which is where `app/` and `scripts/` live.
 `upgrade_schema` adds the intake tables and columns to a database that
 predates them, and backfills expiration deadlines onto existing items —
 without it, older stock has no deadlines and the sweep cannot see it. It is
-idempotent and a no-op once the database is current, and Render also runs it
-on every deploy via `preDeployCommand`, so this manual run matters only if
-you seed before the first deploy.
+idempotent and a no-op once the database is current.
+
+> **Run it before every deploy that changes the schema.** `render.yaml`
+> declares it as a `preDeployCommand`, but pre-deploy commands need a paid
+> instance type and this service is `plan: free`, so that line is inert. The
+> failure mode if you skip it is an API that builds, starts, passes its
+> health check, and then 500s on every item query — because `/health`
+> doesn't touch the `items` table.
 
 `seed_demo` writes to the shared team database — the two demo users, a
 verified demo pantry, the default expiration rules, a small UPC catalog, and
