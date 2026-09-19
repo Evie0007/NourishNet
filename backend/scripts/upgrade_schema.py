@@ -1,11 +1,12 @@
 """
-Bring an existing database up to the intake-pipeline schema.
+Bring an existing database up to the current schema.
 
 `Base.metadata.create_all` at app startup creates missing *tables*. It will
 not add a column to a table that already exists, so a database created
-before this change has an `items` table with no `upc`, no `use_by_date`,
-and no deadline columns — and the app would fail on its first query
-against them.
+before these changes has an `items` table with no `upc`, no `use_by_date`
+and no deadline columns, and a `reservations` table with no
+`scheduled_pickup_at` — and the app would fail on its first query against
+them.
 
 Run once per database, after deploying:
 
@@ -24,20 +25,25 @@ import sys
 
 from sqlalchemy import Enum as SAEnum, inspect, text
 
-from app import expiration, models
+from app import expiration, models, schemas
 from app.database import Base, SessionLocal, engine
 
-# column name -> DDL type, per dialect. The types differ enough between
-# Postgres and SQLite that spelling them out beats trying to render them
-# from the SQLAlchemy column objects.
-NEW_ITEM_COLUMNS = {
-    "upc":             {"postgresql": "VARCHAR(14)", "sqlite": "VARCHAR(14)"},
-    "product_id":      {"postgresql": "UUID",        "sqlite": "CHAR(32)"},
-    "use_by_date":     {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
-    "date_label_type": {"postgresql": "datelabeltype", "sqlite": "VARCHAR(9)"},
-    "date_source":     {"postgresql": "datesource",   "sqlite": "VARCHAR(10)"},
-    "donate_after":    {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
-    "discard_after":   {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
+# table -> column name -> DDL type, per dialect. The types differ enough
+# between Postgres and SQLite that spelling them out beats trying to render
+# them from the SQLAlchemy column objects.
+NEW_COLUMNS = {
+    "items": {
+        "upc":             {"postgresql": "VARCHAR(14)", "sqlite": "VARCHAR(14)"},
+        "product_id":      {"postgresql": "UUID",        "sqlite": "CHAR(32)"},
+        "use_by_date":     {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
+        "date_label_type": {"postgresql": "datelabeltype", "sqlite": "VARCHAR(9)"},
+        "date_source":     {"postgresql": "datesource",   "sqlite": "VARCHAR(10)"},
+        "donate_after":    {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
+        "discard_after":   {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
+    },
+    "reservations": {
+        "scheduled_pickup_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
+    },
 }
 
 # Indexes the hot queries need (NFR-4.6.3). create_all adds these to new
@@ -51,6 +57,7 @@ NEW_INDEXES = [
     ("ix_items_discard_after", "items", "discard_after"),
     ("ix_reservations_status", "reservations", "status"),
     ("ix_reservations_hold_expires_at", "reservations", "hold_expires_at"),
+    ("ix_reservations_scheduled_pickup_at", "reservations", "scheduled_pickup_at"),
 ]
 
 
@@ -74,21 +81,31 @@ def create_enum_types(connection) -> list[str]:
 
 
 def add_missing_columns(connection) -> list[str]:
+    # inspect(connection), not inspect(engine): main() runs this inside a
+    # transaction, and an engine-level inspector checks out a *different*
+    # pooled connection that cannot see uncommitted DDL. That made
+    # add_missing_indexes below skip the index on any column this function
+    # had just added, so it only appeared on a second run.
     dialect = engine.dialect.name
-    existing = {c["name"] for c in inspect(engine).get_columns("items")}
+    inspector = inspect(connection)
+    tables = set(inspector.get_table_names())
 
     added = []
-    for column, types in NEW_ITEM_COLUMNS.items():
-        if column in existing:
-            continue
-        ddl_type = types.get(dialect, types["sqlite"])
-        connection.execute(text(f'ALTER TABLE items ADD COLUMN {column} {ddl_type}'))
-        added.append(column)
+    for table, columns in NEW_COLUMNS.items():
+        if table not in tables:
+            continue  # create_all will have made it complete already
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for column, types in columns.items():
+            if column in existing:
+                continue
+            ddl_type = types.get(dialect, types["sqlite"])
+            connection.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl_type}'))
+            added.append(f"{table}.{column}")
     return added
 
 
 def add_missing_indexes(connection) -> list[str]:
-    inspector = inspect(engine)
+    inspector = inspect(connection)  # see add_missing_columns
     tables = set(inspector.get_table_names())
 
     added = []
@@ -144,6 +161,41 @@ def backfill_deadlines(db) -> int:
     return changed
 
 
+def backfill_scheduled_pickup(db) -> int:
+    """
+    Give pre-existing pending reservations a scheduled pickup time, derived
+    backwards from the hold they already have.
+
+    The direction matters. A live reservation's hold_expires_at is a promise
+    already made to an organization; inventing a schedule and re-deriving
+    the hold from it would either shorten someone's window — they lose food
+    they were told they could collect — or lengthen it, keeping the item out
+    of the pool longer than anyone agreed. Deriving the schedule *from* the
+    hold changes nothing observable. It only fills in a displayed time, and
+    it makes the new invariant (hold = slot + PICKUP_GRACE) true for every
+    live row, so the dashboards do not need a special case.
+
+    Terminal reservations keep NULL, for the same reason backfill_deadlines
+    skips terminal items: their history is the donation record and is not
+    ours to rewrite (FR-11.1).
+
+    A row whose hold has already lapsed is still PENDING only because the
+    sweep has not run; it will be EXPIRED within a minute of startup.
+    Backfilling it produces a pickup time in the past, which is both
+    harmless and honest, so it is not special-cased.
+    """
+    stale = (
+        db.query(models.Reservation)
+        .filter(models.Reservation.status == models.ReservationStatus.PENDING)
+        .filter(models.Reservation.scheduled_pickup_at.is_(None))
+        .all()
+    )
+    for res in stale:
+        res.scheduled_pickup_at = res.hold_expires_at - schemas.PICKUP_GRACE
+    db.commit()
+    return len(stale)
+
+
 def main() -> None:
     print(f"Database: {engine.dialect.name}")
 
@@ -158,7 +210,7 @@ def main() -> None:
         if made:
             print(f"\nEnum types:\n  ensured: {', '.join(made)}")
 
-        print("\nColumns on items:")
+        print("\nColumns:")
         added = add_missing_columns(connection)
         print(f"  added: {', '.join(added) if added else '(none — already present)'}")
 
@@ -175,6 +227,10 @@ def main() -> None:
         print("\nBackfilling deadlines on existing items:")
         changed = backfill_deadlines(db)
         print(f"  updated: {changed} item(s)")
+
+        print("\nBackfilling scheduled pickup times on pending reservations:")
+        scheduled = backfill_scheduled_pickup(db)
+        print(f"  updated: {scheduled} reservation(s)")
     finally:
         db.close()
 

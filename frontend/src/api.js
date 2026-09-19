@@ -14,6 +14,28 @@ export const setUnauthorizedHandler = (fn) => {
   onUnauthorized = fn;
 };
 
+/**
+ * Pull a displayable message out of an error body.
+ *
+ * FastAPI returns a string `detail` for the errors we raise by hand, but
+ * Pydantic validation failures return an *array* of {loc, msg, type}
+ * objects. Passing that array straight to `new Error` renders the string
+ * "[object Object]", which is what the user would have seen for every
+ * out-of-range pickup time.
+ */
+function detailMessage(body, fallback) {
+  const detail = body?.detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      // Pydantic prefixes messages raised from a validator with
+      // "Value error, ", which is noise to the person reading it.
+      .map((e) => String(e?.msg || "").replace(/^Value error, /, ""))
+      .filter(Boolean);
+    return messages.join(" ") || fallback;
+  }
+  return detail || fallback;
+}
+
 async function request(path, options = {}) {
   const token = getToken();
   const res = await fetch(`${BASE_URL}${path}`, {
@@ -29,12 +51,12 @@ async function request(path, options = {}) {
     clearToken();
     onUnauthorized();
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || "Your session ended. Sign in again.");
+    throw new Error(detailMessage(body, "Your session ended. Sign in again."));
   }
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `Request failed: ${res.status}`);
+    throw new Error(detailMessage(body, `Request failed: ${res.status}`));
   }
 
   // 204 No Content (logout) has no body to parse.
@@ -72,7 +94,7 @@ async function postFile(path, file, field = "image") {
   }
   if (!res.ok) {
     const payload = await res.json().catch(() => ({}));
-    throw new Error(payload.detail || `Upload failed: ${res.status}`);
+    throw new Error(detailMessage(payload, `Upload failed: ${res.status}`));
   }
   return res.json();
 }
@@ -124,8 +146,14 @@ export const api = {
   registerPantry: (data) => post("/pantries", data),
 
   // ---- reservations ----
-  createReservation: (itemId, holdMinutes = 180) =>
-    post("/reservations", { item_id: itemId, hold_minutes: holdMinutes }),
+  // `scheduledPickupLocal` is the raw value out of an
+  // <input type="datetime-local">. The hold is derived from it server-side
+  // (slot + 30 minutes), so there is no hold length to pass.
+  createReservation: (itemId, scheduledPickupLocal) =>
+    post("/reservations", {
+      item_id: itemId,
+      scheduled_pickup_at: toUtcIso(scheduledPickupLocal),
+    }),
   myReservations: () => request("/reservations/mine"),
   allReservations: () => request("/reservations"),
   cancelReservation: (id) => post(`/reservations/${id}/cancel`),
@@ -145,4 +173,38 @@ export function parseUtc(value) {
   if (!value) return null;
   const hasZone = /(Z|[+-]\d{2}:?\d{2})$/.test(value);
   return new Date(hasZone ? value : `${value}Z`);
+}
+
+/**
+ * An <input type="datetime-local"> value ("2026-09-19T14:30") is local
+ * wall time with no zone. Convert it to an offset-bearing instant before
+ * sending — the API rejects a naive datetime outright, precisely so this
+ * conversion cannot be skipped by accident.
+ *
+ * `new Date()` on a string is correct here and nowhere else in this file:
+ * the offsetless datetime-local form is specified to be read as local, and
+ * this value came from a form rather than from the API. The house rule
+ * against `new Date()` is about values the backend sent us.
+ */
+export function toUtcIso(localValue) {
+  if (!localValue) return null;
+  const d = new Date(localValue);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * The inverse: a Date to the string a datetime-local control expects.
+ *
+ * Deliberately not `toISOString().slice(0, 16)`, which yields UTC. The
+ * control reads its value, min and max as local wall time, so a UTC string
+ * shifts every bound by the viewer's offset — the same class of bug
+ * parseUtc exists to prevent, just pointing the other way.
+ */
+export function toLocalInputValue(date) {
+  if (!date || Number.isNaN(date.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  );
 }

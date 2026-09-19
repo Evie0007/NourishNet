@@ -29,9 +29,15 @@ def reserve_item(
     user: models.User = Depends(auth.require_organizer),
 ):
     """
-    Reserves an AVAILABLE item for the caller's organization and starts the
-    holding-window clock (default 3 hours, Section 13.3). Returns a QR code
-    string the organizer's dashboard renders for pickup.
+    Reserves an AVAILABLE item for the caller's organization at a scheduled
+    pickup time, and holds it until PICKUP_GRACE past that slot (FR-8.6).
+    Returns a QR code string the organizer's dashboard renders for pickup.
+
+    Note the ordering: Pydantic validates the body before this function
+    runs, so an unverified organization submitting an out-of-range pickup
+    time sees the 422 about the time, not the 403 about verification. That
+    is acceptable — they hit the 403 on the next attempt — but it is why
+    the verification test below cannot assume it runs first.
     """
     # FR-7.4: unverified organizations may browse but not reserve. This is
     # the gate the Good Samaritan Act protection depends on (NFR-4.8.3).
@@ -45,11 +51,21 @@ def reserve_item(
             ),
         )
 
-    reservation = crud.create_reservation(db, res, pantry_id=user.pantry_id)
-    if not reservation:
+    reservation, outcome = crud.create_reservation(db, res, pantry_id=user.pantry_id)
+    if outcome == "unavailable":
         raise HTTPException(
             status_code=409,
             detail="That item was just reserved by someone else. Refresh to see what's still available.",
+        )
+    if outcome == "past_discard":
+        item = db.get(models.Item, res.item_id)
+        deadline = item.discard_after.strftime("%Y-%m-%d %H:%M") if item else "its discard time"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This item has to be off the shelf by {deadline} UTC. "
+                "Choose a pickup time before then."
+            ),
         )
     return _detail(reservation)
 
@@ -118,8 +134,31 @@ def confirm_pickup(
     this endpoint was open and the confirm form lived on the organizer's
     own page, which meant the party receiving the food confirmed its own
     pickup.
+
+    The failure messages name the actual reason (FR-9.6, FR-9.8). A staff
+    member scanning at the shelf has no other channel to find out whether
+    the problem is the wrong code, a second scan, or an organization that
+    arrived too late.
     """
-    reservation = crud.confirm_pickup(db, qr_code)
-    if not reservation:
-        raise HTTPException(status_code=404, detail="Invalid or already-used QR code")
+    reservation, outcome = crud.confirm_pickup(db, qr_code)
+
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="That code doesn't match any reservation.")
+    if outcome == "already_picked_up":
+        when = reservation.picked_up_at.strftime("%H:%M") if reservation.picked_up_at else "earlier"
+        raise HTTPException(status_code=409, detail=f"Already collected at {when} UTC.")
+    if outcome == "cancelled":
+        raise HTTPException(
+            status_code=409,
+            detail="That reservation was cancelled. The item is back in the available pool.",
+        )
+    if outcome == "expired":
+        when = reservation.hold_expires_at.strftime("%H:%M") if reservation.hold_expires_at else ""
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The hold lapsed at {when} UTC and the item has returned to the "
+                "available pool. Ask them to reserve it again."
+            ),
+        )
     return _detail(reservation)

@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * Live barcode scanning from a camera.
+ * Live code scanning from a camera.
+ *
+ * Two jobs, chosen with `mode`: retail barcodes at the intake desk
+ * (`"retail"`, the default) and pickup QR codes at the shelf (`"qr"`).
+ * Everything that differs between them lives in the MODES table below —
+ * see the note there on why this is one named mode rather than a handful
+ * of independent props.
  *
  * Two decoders, picked at runtime:
  *
@@ -32,17 +38,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * trip per frame would make it unusable.
  */
 
-// UPC-A, UPC-E, EAN-13, EAN-8. Deliberately not QR or Code 128: a
-// narrower set is faster per frame and cannot return a shipping label's
-// tracking code when someone means to scan the product.
-const RETAIL_FORMATS = ["upc_a", "upc_e", "ean_13", "ean_8"];
-
 const SCAN_INTERVAL_MS = 200;
-
-// The same code has to be read this many times in a row before it counts.
-// A single frame can decode wrong under motion blur; two identical reads
-// in a row essentially cannot. The check digit catches the rest.
-const CONFIRMATIONS_REQUIRED = 2;
 
 // How long a scan goes quiet before the status line stops repeating itself
 // and starts suggesting what to change. Saying the same thing at second 1
@@ -50,15 +46,76 @@ const CONFIRMATIONS_REQUIRED = 2;
 // than that they are holding it wrong.
 const COACH_AFTER_MS = 8000;
 
-// The aiming rectangle, normalized against the video frame.
-//
-// The box a person aims with and the box the decoder reads have to be the
-// same rectangle, or the guidance is a lie — which is what it was when
-// this was a CSS inset on an aria-hidden div and every frame went to the
-// decoder whole. Both the overlay and the crop derive from this constant.
-const AIM_BOX = { x: 0.1, y: 0.35, w: 0.8, h: 0.3 };
+/**
+ * The two things this component is pointed at, and everything that
+ * differs between them.
+ *
+ * A single `formats` prop would not have been enough, and would have
+ * failed quietly: the format list is one of six decisions that have to
+ * move together. Pass QR formats while `normalize` still strips
+ * non-digits and the scanner reads the code perfectly, hands back the
+ * four digits that survived, and the server reports an invalid token.
+ *
+ * `aimBox` is normalized against the video frame. The box a person aims
+ * with and the box the decoder reads have to be the same rectangle or the
+ * guidance is a lie, so both the overlay and the crop derive from it.
+ */
+const MODES = {
+  // UPC-A, UPC-E, EAN-13, EAN-8. A narrow set is faster per frame and
+  // cannot return a shipping label's tracking code when someone means to
+  // scan the product.
+  retail: {
+    subject: "barcode",
+    formats: ["upc_a", "upc_e", "ean_13", "ean_8"],
+    zxingReader: "oned",
+    zxingFormats: ["UPC_A", "UPC_E", "EAN_13", "EAN_8"],
+    normalize: (raw) => String(raw || "").replace(/\D/g, ""),
+    // A single frame can decode a 1D symbol wrong under motion blur; two
+    // identical reads in a row essentially cannot. The check digit catches
+    // the rest.
+    confirmations: 2,
+    // A letterbox: retail barcodes are wide and short.
+    aimBox: { x: 0.1, y: 0.35, w: 0.8, h: 0.3 },
+    aimHint: "Fill the white box with the barcode, hold steady, and give it good light.",
+    coachHint:
+      "Still looking. Move closer so the barcode fills the white box, flatten any " +
+      "curve in the package, add light — or hold it steady and press Capture.",
+    captureFail:
+      "Couldn't read that one. Flatten the package so the bars aren't curved, fill " +
+      "the white box, and try again — or type the digits under the barcode.",
+    manualHint:
+      "Can't get a read? Close this and type the digits under the barcode — it's the same thing.",
+  },
+  // Pickup tokens. These are base64url, so the retail digit-strip would
+  // destroy them.
+  qr: {
+    subject: "QR code",
+    formats: ["qr_code"],
+    zxingReader: "qr",
+    zxingFormats: ["QR_CODE"],
+    normalize: (raw) => String(raw || "").trim(),
+    // One read is enough. QR carries Reed–Solomon error correction, so a
+    // decode either satisfies the ECC or throws — there is no
+    // misread-under-blur failure mode to defend against, and asking for a
+    // second read only makes the scan feel sluggish at the shelf.
+    confirmations: 1,
+    // Nearly square, and taller: a QR fills the frame rather than
+    // stretching across it, and the retail letterbox would crop its top
+    // and bottom off.
+    aimBox: { x: 0.2, y: 0.15, w: 0.6, h: 0.7 },
+    aimHint: "Hold the phone's QR code inside the white box.",
+    coachHint:
+      "Still looking. Move the phone closer or further back so the whole code sits " +
+      "inside the white box, and turn its screen brightness up.",
+    captureFail:
+      "Couldn't read that one. Turn the phone's brightness up, avoid glare on the " +
+      "screen, and fill the white box — or enter the code by hand.",
+    manualHint: "Can't get a read? Close this and enter the code by hand instead.",
+  },
+};
 
-export default function BarcodeScanner({ onDetected, onClose }) {
+export default function BarcodeScanner({ onDetected, onClose, mode = "retail" }) {
+  const cfg = MODES[mode] || MODES.retail;
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const stopRef = useRef(null);
@@ -88,7 +145,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
 
   const handleHit = useCallback(
     (raw) => {
-      const code = String(raw || "").replace(/\D/g, "");
+      const code = cfg.normalize(raw);
       if (!code || finished.current) return;
 
       if (lastRead.current.code === code) {
@@ -97,14 +154,14 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         lastRead.current = { code, count: 1 };
       }
 
-      if (lastRead.current.count >= CONFIRMATIONS_REQUIRED) {
+      if (lastRead.current.count >= cfg.confirmations) {
         finished.current = true;
-        // The server still normalizes and checks the check digit — this is
+        // The server still validates whatever comes out of here — this is
         // a convenience layer over the keyboard, never a source of trust.
         onDetected(code);
       }
     },
-    [onDetected],
+    [onDetected, cfg],
   );
 
   const stop = useCallback(() => {
@@ -134,7 +191,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
       if (!navigator.mediaDevices?.getUserMedia) {
         setStatus("error");
         setMessage(
-          "This browser won't give a page camera access. Type the barcode instead.",
+          `This browser won't give a page camera access. Enter the ${cfg.subject} by hand instead.`,
         );
         return;
       }
@@ -170,19 +227,19 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         listCameras();
         setTorchAvailable(await applyTrackTuning(stream.getVideoTracks()[0]));
 
-        const detector = await makeNativeDetector();
+        const detector = await makeNativeDetector(cfg.formats);
         if (detector) {
           detectorRef.current = detector;
           setEngine("browser");
-          stopRef.current = runNative(detector, videoRef, canvasRef, handleHit);
+          stopRef.current = runNative(detector, videoRef, canvasRef, handleHit, cfg.aimBox);
         } else {
           setEngine("zxing");
-          stopRef.current = await runZxing(videoRef, stream, zxingReaderRef, handleHit);
+          stopRef.current = await runZxing(videoRef, stream, zxingReaderRef, handleHit, cfg);
         }
       } catch (err) {
         if (cancelled) return;
         setStatus("error");
-        setMessage(describeCameraError(err));
+        setMessage(describeCameraError(err, cfg.subject));
       }
     }
 
@@ -191,7 +248,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
       cancelled = true;
       stop();
     };
-  }, [deviceId, handleHit, listCameras, stop]);
+  }, [deviceId, handleHit, listCameras, stop, cfg]);
 
   // Keep the overlay glued to the picture. The <video> is object-contain
   // inside a max-height box, so the element is letterboxed and an inset in
@@ -201,7 +258,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
     if (status !== "scanning") return undefined;
 
     function reposition() {
-      const rect = aimOverlayRect(videoRef.current);
+      const rect = aimOverlayRect(videoRef.current, cfg.aimBox);
       if (rect) setAimStyle(rect);
     }
 
@@ -212,7 +269,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
       clearInterval(timer);
       window.removeEventListener("resize", reposition);
     };
-  }, [status]);
+  }, [status, cfg]);
 
   // Nudge after a silent stretch. Reset by an actual read, which only
   // happens on the way out, so in practice this fires whenever someone is
@@ -257,15 +314,16 @@ export default function BarcodeScanner({ onDetected, onClose }) {
     setCapturing(true);
     setMessage("");
     try {
+      const box = cfg.aimBox;
       const attempts = [
-        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1),
+        () => cropFrame(video, captureCanvasRef, box, 1),
         // Upscaled with smoothing off: thin bars survive as hard edges
         // rather than being averaged into grey, which both decoders need.
-        () => cropFrame(video, captureCanvasRef, AIM_BOX, 2),
+        () => cropFrame(video, captureCanvasRef, box, 2),
         // For someone who aimed badly rather than held badly.
         () => cropFrame(video, captureCanvasRef, FULL_FRAME, 1),
-        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1, 90),
-        () => cropFrame(video, captureCanvasRef, AIM_BOX, 1, 270),
+        () => cropFrame(video, captureCanvasRef, box, 1, 90),
+        () => cropFrame(video, captureCanvasRef, box, 1, 270),
       ];
 
       for (const build of attempts) {
@@ -274,15 +332,12 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         const code = await decodeCanvas(canvas, detectorRef.current, zxingReaderRef.current);
         if (code) {
           finished.current = true;
-          onDetected(String(code).replace(/\D/g, ""));
+          onDetected(cfg.normalize(code));
           return;
         }
       }
 
-      setMessage(
-        "Couldn't read that one. Flatten the package so the bars aren't curved, " +
-          "fill the white box, and try again — or type the digits under the barcode.",
-      );
+      setMessage(cfg.captureFail);
     } finally {
       setCapturing(false);
     }
@@ -316,15 +371,10 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         {status === "starting" && "Waiting for the camera…"}
         {status === "scanning" &&
           (coaching ? (
-            <span className="text-gray-700">
-              Still looking. Move closer so the barcode fills the white box, flatten
-              any curve in the package, add light — or hold it steady and press
-              Capture.
-            </span>
+            <span className="text-gray-700">{cfg.coachHint}</span>
           ) : (
             <>
-              Fill the white box with the barcode, hold steady, and give it good
-              light.{" "}
+              {cfg.aimHint}{" "}
               <span className="text-gray-400">
                 ({engine === "browser" ? "browser decoder" : "ZXing"})
               </span>
@@ -378,10 +428,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         >
           Stop scanning
         </button>
-        <span className="text-xs text-gray-500">
-          Can't get a read? Close this and type the digits under the barcode —
-          it's the same thing.
-        </span>
+        <span className="text-xs text-gray-500">{cfg.manualHint}</span>
       </div>
     </div>
   );
@@ -398,10 +445,11 @@ const FULL_FRAME = { x: 0, y: 0, w: 1, h: 1 };
  * `object-contain` letterboxes: the picture is centred inside the element
  * with bars on two sides. Positioning the overlay against the element
  * would put it over the bars on a laptop, where the 16:9 stream sits in a
- * much wider box. This finds the picture first, then applies AIM_BOX to
- * it, so the overlay and the crop are the same rectangle by construction.
+ * much wider box. This finds the picture first, then applies the mode's
+ * aiming box to it, so the overlay and the crop are the same rectangle by
+ * construction.
  */
-function aimOverlayRect(video) {
+function aimOverlayRect(video, aimBox) {
   if (!video || !video.videoWidth || !video.clientWidth) return null;
 
   const scale = Math.min(
@@ -414,10 +462,10 @@ function aimOverlayRect(video) {
   const offsetY = (video.clientHeight - shownH) / 2;
 
   return {
-    left: `${offsetX + shownW * AIM_BOX.x}px`,
-    top: `${offsetY + shownH * AIM_BOX.y}px`,
-    width: `${shownW * AIM_BOX.w}px`,
-    height: `${shownH * AIM_BOX.h}px`,
+    left: `${offsetX + shownW * aimBox.x}px`,
+    top: `${offsetY + shownH * aimBox.y}px`,
+    width: `${shownW * aimBox.w}px`,
+    height: `${shownH * aimBox.h}px`,
   };
 }
 
@@ -505,11 +553,11 @@ async function applyTrackTuning(track) {
  * Constructing it and asking for supported formats is the only honest
  * test: Safari and some Chromium builds expose the global and then fail.
  */
-async function makeNativeDetector() {
+async function makeNativeDetector(wanted) {
   if (typeof window === "undefined" || !("BarcodeDetector" in window)) return null;
   try {
     const supported = await window.BarcodeDetector.getSupportedFormats();
-    const formats = RETAIL_FORMATS.filter((f) => supported.includes(f));
+    const formats = wanted.filter((f) => supported.includes(f));
     if (formats.length === 0) return null;
     return new window.BarcodeDetector({ formats });
   } catch {
@@ -517,7 +565,8 @@ async function makeNativeDetector() {
   }
 }
 
-/** Run one canvas past whichever decoder is live. Returns digits or null. */
+/** Run one canvas past whichever decoder is live. Returns the raw decoded
+ *  text, or null — the caller normalizes it for its mode. */
 async function decodeCanvas(canvas, detector, zxingReader) {
   if (detector) {
     try {
@@ -547,7 +596,7 @@ async function decodeCanvas(canvas, detector, zxingReader) {
  * symbol covering a tenth of it is both slower and less reliable than
  * searching the region the person was told to aim with.
  */
-function runNative(detector, videoRef, canvasRef, onHit) {
+function runNative(detector, videoRef, canvasRef, onHit, aimBox) {
   let stopped = false;
   // detect() is async and the canvas is reused, so a tick that overruns
   // the interval would have its frame redrawn underneath it. Skipping the
@@ -560,7 +609,7 @@ function runNative(detector, videoRef, canvasRef, onHit) {
     if (stopped || inFlight || !video || video.readyState < 2) return;
     inFlight = true;
     try {
-      const canvas = cropFrame(video, canvasRef, AIM_BOX, 1);
+      const canvas = cropFrame(video, canvasRef, aimBox, 1);
       if (!canvas) return;
       const found = await detector.detect(canvas);
       if (found.length > 0) onHit(found[0].rawValue);
@@ -580,41 +629,39 @@ function runNative(detector, videoRef, canvasRef, onHit) {
 /**
  * ZXing fallback, loaded on demand. Returns a stop function.
  *
- * Restricted to the retail 1D formats for the same reason as the native
+ * Restricted to the mode's formats for the same reason as the native
  * path, and because ZXing gets materially faster when it isn't trying
- * every symbology on every frame.
+ * every symbology on every frame. That is also why this picks a
+ * symbology-specific reader rather than BrowserMultiFormatReader — and in
+ * QR mode it is not merely an optimization: the OneD reader cannot decode
+ * a 2D symbol at all.
  *
  * The live path streams the whole element — `decodeFromStream` owns the
  * video and can't be given a crop — so ZXing browsers get the aiming box
  * on the Capture path instead, via the reader stashed in `readerRef`.
  */
-async function runZxing(videoRef, stream, readerRef, onHit) {
+async function runZxing(videoRef, stream, readerRef, onHit, cfg) {
   // The dynamic import above gives React time to unmount underneath us —
   // 400KB is a slow first load on a store network. Without this guard
   // ZXing is handed a null element and throws where the user sees it.
   if (!videoRef.current) return () => {};
 
-  const [{ BrowserMultiFormatOneDReader }, { BarcodeFormat, DecodeHintType }] =
+  const [{ BrowserMultiFormatOneDReader, BrowserQRCodeReader }, { BarcodeFormat, DecodeHintType }] =
     await Promise.all([import("@zxing/browser"), import("@zxing/library")]);
 
   if (!videoRef.current) return () => {};
 
   const hints = new Map([
-    [
-      DecodeHintType.POSSIBLE_FORMATS,
-      [
-        BarcodeFormat.UPC_A,
-        BarcodeFormat.UPC_E,
-        BarcodeFormat.EAN_13,
-        BarcodeFormat.EAN_8,
-      ],
-    ],
+    [DecodeHintType.POSSIBLE_FORMATS, cfg.zxingFormats.map((name) => BarcodeFormat[name])],
     // More scan lines per pass. Worth the CPU on a curved package, where
     // the row through the middle is the one most likely to be distorted.
     [DecodeHintType.TRY_HARDER, true],
   ]);
 
-  const reader = new BrowserMultiFormatOneDReader(hints, {
+  // Both extend BrowserCodeReader and take the same (hints, options), so
+  // decodeCanvas and decodeFromStream work unchanged across the two.
+  const Reader = cfg.zxingReader === "qr" ? BrowserQRCodeReader : BrowserMultiFormatOneDReader;
+  const reader = new Reader(hints, {
     delayBetweenScanAttempts: SCAN_INTERVAL_MS,
   });
   readerRef.current = reader;
@@ -634,7 +681,7 @@ async function runZxing(videoRef, stream, readerRef, onHit) {
  * the real problem is the URL, and someone will otherwise spend an
  * afternoon re-granting a permission that was never the issue.
  */
-function describeCameraError(err) {
+function describeCameraError(err, subject = "barcode") {
   const name = err?.name || "";
 
   if (!window.isSecureContext) {
@@ -647,7 +694,7 @@ function describeCameraError(err) {
     return "Camera access was blocked. Allow it for this site in the browser's address bar, then try again.";
   }
   if (name === "NotFoundError" || name === "OverconstrainedError") {
-    return "No camera found. Plug one in, or type the barcode instead.";
+    return `No camera found. Plug one in, or enter the ${subject} by hand instead.`;
   }
   if (name === "NotReadableError") {
     return "The camera is in use by another app. Close it (Teams, Zoom, Camera) and try again.";

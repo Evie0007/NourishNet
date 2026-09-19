@@ -34,6 +34,7 @@ What to look for in the output:
     stable goods is a quality date, not a safety one.
 """
 import os
+import secrets
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -152,11 +153,25 @@ def main():
             # outlive the food, to show what happens to a promise that the
             # safety deadline overtakes.
             if not reserved and items[0].status == models.ItemStatus.AVAILABLE:
-                crud.create_reservation(
-                    db,
-                    schemas.ReservationCreate(item_id=items[0].id, hold_minutes=60 * 24 * 30),
-                    pantry.id,
+                # Built directly rather than through crud.create_reservation.
+                # That path validates the pickup time against the real wall
+                # clock and refuses a slot past the item's discard deadline —
+                # both correct for a live request, and both impossible to
+                # satisfy here, where the clock is simulated and the whole
+                # point is a hold the safety deadline overtakes.
+                items[0].status = models.ItemStatus.RESERVED
+                db.add(
+                    models.Reservation(
+                        item_id=items[0].id,
+                        pantry_id=pantry.id,
+                        status=models.ReservationStatus.PENDING,
+                        reserved_at=now,
+                        scheduled_pickup_at=now + timedelta(days=30),
+                        hold_expires_at=now + timedelta(days=30) + schemas.PICKUP_GRACE,
+                        qr_code=secrets.token_urlsafe(16),
+                    )
                 )
+                db.commit()
                 print(
                     "  " + " " * 17 + " >  a pantry reserved the sourdough, on a hold long "
                     "enough to outlast the bread"

@@ -518,11 +518,19 @@ def create_reservation(
     db: Session,
     res: schemas.ReservationCreate,
     pantry_id: str,
-) -> Optional[models.Reservation]:
+) -> tuple[Optional[models.Reservation], str]:
     """
     Claims an AVAILABLE item for `pantry_id` and starts the holding-window
     clock. `pantry_id` comes from the authenticated user, never from the
     request body (FR-2.3).
+
+    The hold is derived from the organization's scheduled pickup time
+    (FR-8.6) rather than running for a flat three hours from the click. The
+    old shape held the food for a window that had nothing to do with when
+    anyone intended to arrive, so staff could not plan and a no-show tied
+    the item up for the full three hours. Now the organization states a
+    slot, the hold is that slot plus PICKUP_GRACE, and the food returns to
+    the pool half an hour after a missed pickup.
 
     The claim is a conditional UPDATE rather than a read-then-write. The
     previous version read item.status, then wrote, with no lock in
@@ -531,6 +539,9 @@ def create_reservation(
     (NFR-4.7.1). Here the database decides the winner: whoever's UPDATE
     matches zero rows lost the race and gets the same 409 as someone
     reserving an already-taken item.
+
+    Returns (reservation, outcome). Outcomes: "ok", "unavailable" (lost the
+    race or never eligible), "past_discard" (see below).
     """
     claimed = (
         db.query(models.Item)
@@ -543,18 +554,31 @@ def create_reservation(
     )
     if claimed == 0:
         db.rollback()
-        return None
+        return None, "unavailable"
+
+    # A slot may not be booked past the moment the food has to leave the
+    # shelf. expiration.sweep() moves any RESERVED item past its
+    # discard_after to EXPIRED_HOLD, so without this check a 24-hour
+    # booking on short-dated produce would be silently killed overnight and
+    # the organization would discover it at the shelf. Refusing here costs
+    # them one retry; the alternative costs them the trip. This lives in
+    # crud rather than the schema validator because it needs the Item row.
+    item = db.get(models.Item, res.item_id)
+    if item and item.discard_after and res.scheduled_pickup_at > item.discard_after:
+        db.rollback()
+        return None, "past_discard"
 
     db_res = models.Reservation(
         item_id=res.item_id,
         pantry_id=pantry_id,
-        hold_expires_at=datetime.utcnow() + timedelta(minutes=res.hold_minutes),
+        scheduled_pickup_at=res.scheduled_pickup_at,
+        hold_expires_at=res.scheduled_pickup_at + schemas.PICKUP_GRACE,
         qr_code=secrets.token_urlsafe(16),
     )
     db.add(db_res)
     db.commit()
     db.refresh(db_res)
-    return db_res
+    return db_res, "ok"
 
 
 def list_reservations(
@@ -601,6 +625,12 @@ def expire_stale_reservations(db: Session):
     Run periodically (cron / background task). Any PENDING reservation past
     its hold window gets marked EXPIRED and the item goes back to AVAILABLE
     so another pantry can grab it — mirrors Section 13.3's mitigation.
+
+    Unchanged by scheduled pickups: hold_expires_at is still a real stored
+    column, only its derivation moved (it is now the scheduled slot plus
+    PICKUP_GRACE, not a flat window from the click). In practice that means
+    this fires thirty minutes after a missed pickup rather than three hours
+    after a reservation, with no new logic here.
     """
     now = datetime.utcnow()
     stale = (
@@ -618,10 +648,47 @@ def expire_stale_reservations(db: Session):
     return stale
 
 
-def confirm_pickup(db: Session, qr_code: str) -> Optional[models.Reservation]:
+def confirm_pickup(db: Session, qr_code: str) -> tuple[Optional[models.Reservation], str]:
+    """
+    Redeems a pickup token at the shelf. Returns (reservation, outcome);
+    outcomes are "ok", "not_found", "expired", "already_picked_up" and
+    "cancelled".
+
+    The expiry time governs, not the sweep (FR-9.7). This function used to
+    check the status only, which left an up-to-sixty-second window — the
+    scheduler's interval — in which a lapsed code still redeemed. With the
+    hold now pinned thirty minutes to a promised slot, that window sits
+    exactly where a late arrival turns up, so the check has to happen here.
+    A lapsed scan expires the reservation and releases the item on the spot
+    rather than waiting for the next tick, so the shelf and the screen
+    agree by the time the staff member looks up.
+
+    The outcomes are distinguished rather than collapsed into one failure
+    because the scan result is the only feedback a staff member holding a
+    phone at the shelf gets (FR-9.6, FR-9.8). "Invalid or already-used
+    code" is useless when the real answer is that the organization is forty
+    minutes late and the food went back in the pool at 2:30.
+    """
     db_res = db.query(models.Reservation).filter(models.Reservation.qr_code == qr_code).first()
-    if not db_res or db_res.status != models.ReservationStatus.PENDING:
-        return None
+    if not db_res:
+        return None, "not_found"
+
+    if db_res.status == models.ReservationStatus.PICKED_UP:
+        return db_res, "already_picked_up"
+    if db_res.status == models.ReservationStatus.CANCELLED:
+        return db_res, "cancelled"
+    if db_res.status == models.ReservationStatus.EXPIRED:
+        return db_res, "expired"
+
+    if db_res.hold_expires_at and db_res.hold_expires_at < datetime.utcnow():
+        db_res.status = models.ReservationStatus.EXPIRED
+        item = db.get(models.Item, db_res.item_id)
+        if item:
+            item.status = models.ItemStatus.AVAILABLE
+        db.commit()
+        db.refresh(db_res)
+        return db_res, "expired"
+
     db_res.status = models.ReservationStatus.PICKED_UP
     db_res.picked_up_at = datetime.utcnow()
     item = db.get(models.Item, db_res.item_id)
@@ -629,4 +696,4 @@ def confirm_pickup(db: Session, qr_code: str) -> Optional[models.Reservation]:
         item.status = models.ItemStatus.PICKED_UP
     db.commit()
     db.refresh(db_res)
-    return db_res
+    return db_res, "ok"
