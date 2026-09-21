@@ -358,7 +358,17 @@ class Reservation(Base):
     status = Column(SAEnum(ReservationStatus), default=ReservationStatus.PENDING, nullable=False, index=True)
 
     reserved_at = Column(DateTime, default=datetime.utcnow)
-    hold_expires_at = Column(DateTime, nullable=False, index=True)   # reserved_at + holding window (e.g. 3h)
+
+    # When the organization said it would arrive (FR-8.6). Nullable at the
+    # database layer even though the API requires it: SQLite cannot add a
+    # NOT NULL column to an existing table without a default, and
+    # reservations that reached a terminal state before this column existed
+    # are deliberately left NULL rather than back-dated with a time nobody
+    # ever promised. Do not tighten this without reading
+    # scripts/upgrade_schema.py first.
+    scheduled_pickup_at = Column(DateTime, nullable=True, index=True)
+
+    hold_expires_at = Column(DateTime, nullable=False, index=True)   # scheduled_pickup_at + PICKUP_GRACE
 
     qr_code = Column(String, nullable=True, unique=True)
     picked_up_at = Column(DateTime, nullable=True)

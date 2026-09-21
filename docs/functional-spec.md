@@ -67,7 +67,7 @@ NourishNet reduces grocery-retail food waste by automating the path from "this i
 | **Item** | A single physical unit or batch of a product on a shelf, tracked individually through its lifecycle. |
 | **OCR** | Optical character recognition — extracting machine-readable text from a photograph of a product label. |
 | **Organization / Pantry** | A nonprofit food pantry or similar entity that receives donations. Used interchangeably; `Pantry` is the entity name in code. |
-| **Scheduled pickup time** | The specific time within the hold window at which the organization commits to arrive. |
+| **Scheduled pickup time** | The time at which the organization commits to arrive. It is chosen first and the hold window is derived from it, not the other way round — see FR-8.6. |
 | **Sell-by date** | The date by which a retailer should sell or remove a product. **Not** a safety deadline. |
 | **SKU** | Stock Keeping Unit — the store's internal product identifier. |
 | **Use-by date** | The manufacturer's estimate of peak quality, and for a small class of products (e.g. infant formula) a safety limit. |
@@ -274,7 +274,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 | **FR-3.7** | Staff MUST be able to register a shelf with a name, location, and optional camera identifier. | Must | ✅ *(`StorePage.jsx:70-89`, `app/routers/shelves.py:11-13`)* |
 | **FR-3.8** | Staff MUST be able to add an item manually, specifying name, SKU, category, batch, shelf, and sell-by date. | Must | ◐ *(name, SKU, and shelf only: `StorePage.jsx:101-133`)* |
 | **FR-3.9** | Item creation MUST reject a `shelf_id` that does not correspond to an existing shelf, returning 422. | Must | ○ *(currently unvalidated: `app/crud.py:51-56`)* |
-| **FR-3.10** | The dashboard MUST provide a QR scanning interface for confirming pickup at the shelf, using the device camera where available and accepting manual token entry as a fallback. | Must | ○ |
+| **FR-3.10** | The dashboard MUST provide a QR scanning interface for confirming pickup at the shelf, using the device camera where available and accepting manual token entry as a fallback. | Must | ✅ *(`StaffDashboard.jsx` `PickupScan`; camera via `BarcodeScanner` `mode="qr"`, manual entry behind a disclosure)* |
 | **FR-3.11** | The "Simulate OCR scan" control MUST be removed from, or gated behind an explicit development flag in, any build served outside local development. | Must | ○ *(currently unconditional: `StorePage.jsx:144-151`)* |
 
 *Verification:* Seed items in each status; confirm counts and queue contents. Correct a `needs_review` item end to end and confirm the resulting status and stored date. Confirm the near-expiry view matches `GET /items/near-expiry?within_hours=48`.
@@ -362,7 +362,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 ### FR-8 Donation Discovery, Reservation, and Scheduling
 
-> **Status: ◐ Partial.** Reservation works with a hold window (`app/crud.py:138-154`). Scheduling does not exist — an organization gets a 3-hour expiry but never states when it will actually arrive. The `scheduled_pickup_at` field specified here is the principal data-model addition in this revision.
+> **Status: ✅ Built.** Scheduling exists. The relationship between the two times is the **inverse** of what earlier revisions of this section specified: rather than the organization picking a slot inside an independently-determined hold window, the organization picks the slot and the hold is derived from it — `hold_expires_at = scheduled_pickup_at + 30 minutes`. A slot may be booked up to 24 hours ahead, and never past the item's `discard_after`. `hold_minutes` is gone from the API; there is no longer a hold length to configure separately from the slot.
 
 | ID | Requirement | Priority | Status |
 |---|---|---|---|
@@ -370,37 +370,45 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 | **FR-8.2** | The available-items listing MUST show item name, category, sell-by date, and shelf location for each entry. | Must | ◐ *(name only in the UI: `PantryPage.jsx:145`)* |
 | **FR-8.3** | The listing MUST be filterable by category and sortable by sell-by date. | Should | ○ |
 | **FR-8.4** | An organization MUST be able to reserve an `available` item, which MUST make that item unavailable to every other organization immediately. | Must | ✅ *(`app/crud.py:139-151`)* |
-| **FR-8.5** | Reserving MUST start a hold window, defaulting to 180 minutes and configurable per request. | Must | ✅ *(`app/crud.py:143`; `app/schemas.py:109`)* |
-| **FR-8.6** | When reserving, the organization MUST select a **scheduled pickup time** falling at or after `reserved_at` and at or before `hold_expires_at`. A time outside that range MUST be rejected with 422. | Must | ○ **← new field** |
-| **FR-8.7** | An organization MUST be able to change its scheduled pickup time while the reservation is `pending`, subject to the same range constraint. Changing the pickup time MUST NOT extend the hold window. | Should | ○ |
+| **FR-8.5** | ~~Reserving MUST start a hold window, defaulting to 180 minutes and configurable per request.~~ **Superseded by FR-8.6.** The hold is no longer independent of the pickup time, and no longer configurable per request: it is always `scheduled_pickup_at + 30 minutes`. A flat window from the moment of the click told staff nothing about when anyone would arrive, and left a no-show's item tied up for the balance of three hours. | Must | ⊘ superseded |
+| **FR-8.6** | When reserving, the organization MUST select a **scheduled pickup time** at or after the current time and no more than **24 hours** ahead, and no later than the item's `discard_after`. The hold MUST be derived as `scheduled_pickup_at + 30 minutes`. A time outside the permitted range MUST be rejected with 422, and the message MUST name the boundary that was exceeded. | Must | ✅ *(`app/schemas.py` `ReservationCreate`, `PICKUP_GRACE`/`SCHEDULE_HORIZON`; the `discard_after` ceiling in `crud.create_reservation`)* |
+| **FR-8.7** | An organization MUST be able to change the scheduled pickup time of its own `pending` reservation. The new time MUST satisfy the same bounds as a first booking — at or after the current time, and no later than the item's `discard_after`, which MUST be re-checked because a rules change can move it earlier. It MUST additionally fall no later than **`reserved_at` + 24 hours**, and that ceiling MUST be anchored to `reserved_at` rather than to the moment of the change. The hold is then re-derived as `scheduled_pickup_at + 30 minutes`. A time outside the permitted range MUST be rejected with 422, naming the boundary exceeded, and MUST leave the existing reservation untouched. | Should | ○ *(not implemented; cancel and re-reserve is the workaround)* |
 | **FR-8.8** | Reserving an item not in `available` MUST return 409 with a message distinguishing "already reserved" from "not yet eligible." | Must | ◐ *(409 returned with a combined message: `app/routers/reservations.py:19-22`)* |
 | **FR-8.9** | Concurrent reservation attempts on the same item MUST result in exactly one success; the loser MUST receive 409. The check-and-claim MUST be atomic. | Must | ○ **← race condition**, see [NFR-4.7](#47-data-integrity) |
-| **FR-8.10** | An organization MUST be able to view its own reservations, filtered by status, showing item, scheduled pickup time, hold expiry, and QR code. | Must | ◐ *(only the most recent reservation is shown, held in client state: `PantryPage.jsx:157-164`)* |
-| **FR-8.11** | An organization MUST be able to cancel its own `pending` reservation, which MUST return the item to `available` immediately. | Must | ○ *(`CANCELLED` is defined at `app/models.py:41` but is unreachable — no code sets it)* |
+| **FR-8.10** | An organization MUST be able to view its own reservations, filtered by status, showing item, scheduled pickup time, hold expiry, and QR code. | Must | ✅ *(`GET /reservations/mine`; `OrganizerDashboard.jsx` `ReservationCard`)* |
+| **FR-8.11** | An organization MUST be able to cancel its own `pending` reservation, which MUST return the item to `available` immediately. | Must | ✅ *(`POST /reservations/{id}/cancel` → `crud.cancel_reservation`; 404 rather than 403 for another org's reservation, per FR-2.4)* |
 | **FR-8.12** | The system MUST warn an organization approaching its hold expiry with an uncollected reservation, at a configurable lead time. | Could | ○ |
 
-*Verification:* Reserve as a verified organization and confirm the item leaves the available pool. Submit a `scheduled_pickup_at` before `reserved_at` and after `hold_expires_at`; confirm both are rejected. Fire two simultaneous reservations at one item and confirm exactly one succeeds. Cancel and confirm the item returns.
+> **Note on FR-8.7 — why the ceiling is anchored to `reserved_at`.**
+>
+> This requirement previously read *"changing the pickup time MUST NOT extend the hold window."* Once the hold became a function of the pickup time (FR-8.6), that sentence could not be satisfied by any implementation: moving the slot necessarily moves the hold. It was superseded rather than deleted, because the thing it was protecting against is still real.
+>
+> That thing is an indefinite hold. If the 24-hour ceiling were measured from the moment of each change rather than from `reserved_at`, an organization could reserve a scarce item and then, shortly before each deadline, push the slot another 24 hours out — holding it out of every other organization's reach for as long as it liked, without ever collecting it or being expired by the sweep. Anchoring to `reserved_at` caps the total exclusive hold at 24 hours no matter how many times the slot is changed, which is exactly what the superseded clause was for.
+>
+> An organization that genuinely needs longer should cancel and re-reserve, which puts the item back in the pool first and gives everyone else a fair chance at it. That is also the current workaround, since this requirement is not yet built.
+
+*Verification:* Reserve as a verified organization and confirm the item leaves the available pool. Submit a `scheduled_pickup_at` in the past, one more than 24 hours ahead, and one past the item's `discard_after`; confirm all three are rejected with 422 and that the item is not left stranded in `reserved`. Submit a naive datetime and confirm it is rejected rather than read as UTC. Confirm `hold_expires_at` lands exactly 30 minutes after the accepted slot. Fire two simultaneous reservations at one item and confirm exactly one succeeds. Cancel and confirm the item returns. Covered by `backend/tests/test_reservation_scheduling.py`.
 
 ---
 
 ### FR-9 QR Code Generation and Pickup Verification
 
-> **Status: ◐ Partial.** A cryptographically strong token is minted (`secrets.token_urlsafe(16)` — 128 bits of entropy, `app/crud.py:148`) and pickup confirmation works (`app/crud.py:179-190`). But nothing renders an actual QR image — the token is printed as raw text at `PantryPage.jsx:161` — and the confirmation form lives on the *organization's* page (`PantryPage.jsx:166-180`), meaning the party receiving the food confirms its own pickup. Verification must move to the staff side.
+> **Status: ◐ Mostly built.** The token is minted with `secrets.token_urlsafe(16)` (128 bits), rendered as a QR on the organizer's phone, and redeemed by store staff scanning it with the device camera. The hold expiry is now checked at scan time rather than left to the sweep, and failures name their reason. One gap remains: the token still travels as a URL path parameter (FR-9.9).
 
 | ID | Requirement | Priority | Status |
 |---|---|---|---|
 | **FR-9.1** | Every reservation MUST carry a unique, unguessable token generated with a cryptographically secure random source, of at least 128 bits of entropy. | Must | ✅ *(`app/crud.py:148`; uniqueness enforced at `app/models.py:116`)* |
 | **FR-9.2** | The token MUST be single-use. A token already redeemed MUST be rejected. | Must | ✅ *(`app/crud.py:181`)* |
-| **FR-9.3** | The organization portal MUST render the token as a scannable QR image, sized and contrasted to be readable on a phone screen in store lighting. | Must | ○ *(raw text today: `PantryPage.jsx:161`)* |
-| **FR-9.4** | Pickup confirmation MUST be performed by authenticated store staff. An organization MUST NOT be able to confirm its own pickup. | Must | ○ **← control gap** *(currently on the organization's page and unauthenticated)* |
+| **FR-9.3** | The organization portal MUST render the token as a scannable QR image, sized and contrasted to be readable on a phone screen in store lighting. | Must | ✅ *(`OrganizerDashboard.jsx` `<QRCodeSVG size={200} level="M">`)* |
+| **FR-9.4** | Pickup confirmation MUST be performed by authenticated store staff. An organization MUST NOT be able to confirm its own pickup. | Must | ✅ *(`Depends(auth.require_staff)`; an organizer token gets 403)* |
 | **FR-9.5** | Scanning a valid token MUST mark the reservation `picked_up`, record the pickup time, and set the item to `picked_up`. | Must | ✅ *(`app/crud.py:182-187`)* |
-| **FR-9.6** | Scanning MUST fail for a token whose reservation is not `pending` — already collected, expired, or cancelled — and the failure message MUST state which. | Must | ◐ *(rejected, but with an undifferentiated message: `app/routers/reservations.py:41`)* |
-| **FR-9.7** | Scanning a reservation past its `hold_expires_at` but not yet swept by the scheduler MUST be treated as expired, not accepted. The expiry time governs, not the sweep. | Must | ○ **← timing gap** *(`confirm_pickup` checks status but never compares against `hold_expires_at`)* |
-| **FR-9.8** | Repeated confirmation of the same token MUST be idempotent from the staff member's perspective: the second scan reports "already collected at HH:MM" rather than an unexplained error. | Should | ◐ |
+| **FR-9.6** | Scanning MUST fail for a token whose reservation is not `pending` — already collected, expired, or cancelled — and the failure message MUST state which. | Must | ✅ *(`crud.confirm_pickup` returns a named outcome; the router maps each to its own message)* |
+| **FR-9.7** | Scanning a reservation past its `hold_expires_at` but not yet swept by the scheduler MUST be treated as expired, not accepted. The expiry time governs, not the sweep. | Must | ✅ *(`crud.confirm_pickup` compares against `hold_expires_at` and releases the item on the spot)* |
+| **FR-9.8** | Repeated confirmation of the same token MUST be idempotent from the staff member's perspective: the second scan reports "already collected at HH:MM" rather than an unexplained error. | Should | ✅ |
 | **FR-9.9** | The token MUST NOT appear in URL paths, query strings, or server access logs. | Should | ○ *(currently a path parameter: `POST /reservations/pickup/{qr_code}`)* |
-| **FR-9.10** | Staff MUST be able to enter the token manually when a scan fails. | Must | ○ |
+| **FR-9.10** | Staff MUST be able to enter the token manually when a scan fails. | Must | ✅ *("Can't scan? Enter code" disclosure on the Confirm pickup card)* |
 
-*Verification:* Confirm a pickup and confirm both the reservation and the item reach `picked_up`. Re-scan and confirm rejection with the stated reason. Scan a token whose hold has expired but which the scheduler has not swept, and confirm rejection. Confirm the token does not appear in access logs.
+*Verification:* Confirm a pickup and confirm both the reservation and the item reach `picked_up`. Re-scan and confirm rejection names "already collected." Scan a token whose hold has expired but which the scheduler has not swept, and confirm both the rejection and that the item returns to `available`. Confirm an organizer token is refused. Covered by `backend/tests/test_pickup_expiry.py`. The token still appears in the request path (FR-9.9).
 
 ---
 
@@ -510,9 +518,9 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 | ID | Requirement |
 |---|---|
-| **NFR-4.7.1** | **Known race condition.** `create_reservation` reads an item's status, then writes a reservation and mutates the item, with no lock between (`app/crud.py:139-153`). Two concurrent requests can both observe `available` and both proceed — producing two reservations for one physical item, with two valid QR codes. The fix is a conditional update (`UPDATE items SET status='reserved' WHERE id=? AND status='available'`) treating a zero-row result as the 409, or `SELECT ... FOR UPDATE` on Postgres. |
+| **NFR-4.7.1** | ~~**Known race condition.**~~ **Fixed.** `create_reservation` claims the item with a conditional update (`UPDATE items SET status='reserved' WHERE id=? AND status='available'`) and treats a zero-row result as the 409, so the database picks the winner of a concurrent claim. |
 | **NFR-4.7.2** | Item status transitions MUST be validated against the state table ([FR-6.2](#fr-6-item-lifecycle-and-status-transitions)). |
-| **NFR-4.7.3** | `scheduled_pickup_at` MUST be constrained to the hold window at both the API and database layers. |
+| **NFR-4.7.3** | `scheduled_pickup_at` MUST be constrained at the API layer, and SHOULD be at the database layer where the engine allows it. **Partially met.** The API enforces the full rule (not in the past, within 24 hours, not past `discard_after`, hold derived as slot + 30 min). There is no database CHECK: SQLite cannot add one to an existing table, so a constraint would hold in production and not in development — worse than none, because it would only ever fail where it is hardest to debug. Revisit when Alembic lands (NFR-4.6.4) and Postgres-only DDL becomes expressible. |
 | **NFR-4.7.4** | Foreign keys MUST be enforced. SQLite requires `PRAGMA foreign_keys=ON` per connection — verify this is set, or the referential integrity the schema declares is not actually enforced in development. |
 | **NFR-4.7.5** | All timestamps MUST be stored in UTC. The codebase consistently uses `datetime.utcnow()`; note that this function is deprecated in Python 3.12 and SHOULD be migrated to `datetime.now(timezone.utc)`. |
 
@@ -901,10 +909,10 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 1. The coordinator selects an available item and chooses Reserve.
 2. The system determines the acting organization from the authenticated session — **not** from any client-supplied value (FR-2.3).
-3. The system computes the hold window: `hold_expires_at = now + hold_minutes`, default 180 (`app/crud.py:143`).
-4. The system presents the hold window and asks for a **scheduled pickup time** within it.
-5. The coordinator selects a time.
-6. The system validates that the time falls at or after `reserved_at` and at or before `hold_expires_at` (FR-8.6).
+3. The system asks for a **scheduled pickup time**, offering any slot from now up to 24 hours ahead, and no later than the item's `discard_after`.
+4. The coordinator selects a date and time.
+5. The system validates the slot against that range, rejecting a naive datetime outright so a browser cannot submit local wall time as UTC (FR-8.6).
+6. The system derives the hold: `hold_expires_at = scheduled_pickup_at + 30 minutes`.
 7. The system atomically claims the item — transitioning it from `available` to `reserved` only if it is still `available` (NFR-4.7.1).
 8. The system creates the reservation with status `pending` and mints a 128-bit token (`app/crud.py:148`).
 9. The system returns the reservation with its QR code, scheduled pickup time, and hold expiry.
@@ -912,10 +920,10 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 **Alternate flows**
 
-- **6a. The chosen time is outside the hold window.** 422, naming the permitted range. No reservation is created.
+- **5a. The chosen time is outside the permitted range.** 422, naming the boundary that was exceeded — the 24-hour horizon or the item's discard deadline. The claim is rolled back, so no reservation is created and the item does not linger in `reserved`.
 - **7a. The item was claimed between listing and reserving.** 409 stating that another organization reserved it; the listing refreshes. This is the expected outcome of the atomic claim in step 7 and must not be an error the coordinator has to interpret.
 - **1a. The organization is unverified.** 403 (FR-7.4).
-- **5a. The coordinator wants a longer hold.** The request may specify `hold_minutes`; store policy MAY cap it.
+- **5b. The coordinator wants a longer hold.** Not available: the hold is a function of the pickup time, and 24 hours is the ceiling. They may book a later slot instead, subject to the item's discard deadline.
 
 **Exception flows**
 
@@ -986,8 +994,8 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 - **4a. The reservation is already `picked_up`.** The system reports "already collected at HH:MM" and does not alter the record (FR-9.8).
 - **4b. The reservation is `expired`.** The system reports the expiry time and that the item was returned to the pool. If the item is still `available`, the staff member may re-reserve it for the present coordinator on the spot.
 - **4c. The reservation is `cancelled`.** The system reports the cancellation and its time.
-- **4d. The hold window has lapsed but the sweep has not run.** Treated as 4b — `hold_expires_at` governs, not the sweep (FR-9.7). **This check does not exist today**: `confirm_pickup` inspects status only and never compares against `hold_expires_at` (`app/crud.py:179-190`), so a stale reservation can be redeemed in the window between expiry and the next sweep.
-- **3a. The token is unrecognized.** 404, "Invalid code."
+- **4d. The hold window has lapsed but the sweep has not run.** Treated as 4b — `hold_expires_at` governs, not the sweep (FR-9.7). `confirm_pickup` compares against `hold_expires_at` and, on a lapsed scan, expires the reservation and releases the item immediately rather than waiting for the next sweep tick.
+- **3a. The token is unrecognized.** 404, "That code doesn't match any reservation."
 
 **Exception flows**
 
@@ -1189,7 +1197,7 @@ An item belongs to at most one shelf and may have many reservations over its lif
 
 ### 6.6 Reservation
 
-*Source: `app/models.py:104-120`*
+*Source: `app/models.py`, class `Reservation`*
 
 | Field | Type | Constraints | Status |
 |---|---|---|---|
@@ -1198,10 +1206,10 @@ An item belongs to at most one shelf and may have many reservations over its lif
 | `pantry_id` | UUID | FK → Pantry, not null | ✅ *(must derive from session, not request — FR-2.3)* |
 | `status` | Enum(ReservationStatus) | Not null, default `pending` | ✅ |
 | `reserved_at` | DateTime | Default now, UTC | ✅ |
-| `hold_expires_at` | DateTime | Not null, UTC | ✅ *(should be indexed — NFR-4.6.3)* |
+| `hold_expires_at` | DateTime | Not null, UTC; **derived** as `scheduled_pickup_at + 30 min` | ✅ *(indexed)* |
 | `qr_code` | String | Nullable, unique — 128-bit token | ✅ |
 | `picked_up_at` | DateTime | Nullable | ✅ |
-| **`scheduled_pickup_at`** | DateTime | Nullable, UTC; MUST satisfy `reserved_at ≤ value ≤ hold_expires_at` | ○ **← principal addition (FR-8.6)** |
+| **`scheduled_pickup_at`** | DateTime | Nullable, UTC, indexed; MUST satisfy `now ≤ value ≤ reserved_at + 24h` and `value ≤ item.discard_after` | ✅ *(nullable at the DB layer only so the column could be added to existing SQLite tables and so pre-scheduling terminal rows keep NULL — the API requires it)* |
 | `cancelled_at` | DateTime | Nullable | ○ *(FR-8.11)* |
 | `confirmed_by_user_id` | UUID | FK → User, nullable — staff who scanned | ○ *(FR-9.4)* |
 
@@ -1397,13 +1405,14 @@ Base URL: `http://localhost:8000` in development. All request and response bodie
 
 | Method | Path | Auth | Roles | Request | Response | Status |
 |---|---|---|---|---|---|---|
-| `POST` | `/reservations` | Bearer ○ | org_coordinator | `{item_id, hold_minutes?, scheduled_pickup_at}` | `ReservationOut` · 409 unavailable · 422 bad pickup time · 403 unverified | ◐ *(FR-2.3, FR-7.4, FR-8.6, NFR-4.7.1)* |
-| `GET` | `/reservations` | Bearer | org_coordinator (own only); staff, manager (all) | `?status=&from=&to=` | `[ReservationOut]` | ○ *(FR-8.10)* |
+| `POST` | `/reservations` | Bearer | org_coordinator | `{item_id, scheduled_pickup_at}` — offset-aware, no `hold_minutes` | `ReservationDetailOut` · 409 unavailable · 422 bad pickup time · 403 unverified | ✅ *(FR-2.3, FR-7.4, FR-8.6, NFR-4.7.1)* |
+| `GET` | `/reservations` | Bearer | staff, manager, admin | `?status=` | `[ReservationDetailOut]` | ✅ *(store-wide; backs the Pickup schedule card)* |
+| `GET` | `/reservations/mine` | Bearer | org_coordinator | `?status=` | `[ReservationDetailOut]` | ✅ *(FR-8.10; scoped to the caller's org)* |
 | `GET` | `/reservations/{id}` | Bearer | owner org; staff, manager | — | `ReservationOut` · 404 | ○ |
-| `PATCH` | `/reservations/{id}` | Bearer | owner org | `{scheduled_pickup_at}` | `ReservationOut` · 422 | ○ *(FR-8.7)* |
-| `DELETE` | `/reservations/{id}` | Bearer | owner org; manager | — | `ReservationOut` (cancelled) · 409 | ○ *(FR-8.11)* |
-| `POST` | `/reservations/pickup` | Bearer ○ | **staff, manager** | `{token}` in body | `ReservationOut` · 404 · 409 with reason | ◐ **← currently `POST /reservations/pickup/{qr_code}`, unauthenticated, token in the URL path (FR-9.4, FR-9.9)** |
-| `POST` | `/reservations/expire-stale` | Service ○ | scheduler, manager | — | `[ReservationOut]` | ◐ *(FR-10.5 — currently open to anyone)* |
+| `PATCH` | `/reservations/{id}` | Bearer | owner org | `{scheduled_pickup_at}` — offset-aware | `ReservationDetailOut` · 404 not-yours · 409 not pending · 422 outside `[now, min(reserved_at + 24h, discard_after)]` | ○ *(FR-8.7)* |
+| `DELETE` | `/reservations/{id}` | Bearer | owner org; manager | — | `ReservationOut` (cancelled) · 409 | ✅ *(FR-8.11 — shipped as `POST /reservations/{id}/cancel`, 404 not 403 per FR-2.4)* |
+| `POST` | `/reservations/pickup` | Bearer | **staff, manager** | `{token}` in body | `ReservationDetailOut` · 404 · 409 with reason | ◐ **← staff-only and reason-differentiated now; still `POST /reservations/pickup/{qr_code}` with the token in the URL path (FR-9.9)** |
+| `POST` | `/reservations/expire-stale` | Bearer | manager, admin | — | `[ReservationOut]` | ✅ *(FR-10.5; the scheduler also runs it every 60s)* |
 
 ### 8.7 Reporting — all proposed
 
@@ -1479,27 +1488,27 @@ Ordered by severity. This doubles as a build backlog.
 | **3** | **Organization verification is never applied.** `verified` is never set true, and `create_reservation` never checks it (`app/crud.py:138-154`). | Unverified or fraudulent organizations can reserve food. Good Samaritan Act protection depends on the recipient being a verified nonprofit. | FR-7.4, FR-7.5 | **Critical** |
 | **4** | **Reservation race condition.** Check-then-act with no lock (`app/crud.py:139-153`). | Two organizations can hold valid QR codes for one physical item, producing a dispute at the shelf. | FR-8.9, NFR-4.7.1 | **High** |
 | **5** | **Expiry never runs automatically.** `expire-stale` is a manual, open endpoint (`app/routers/reservations.py:26-33`). | An uncollected reservation strands food indefinitely — the exact waste the system exists to prevent. | FR-10.2, FR-10.5 | **High** |
-| **6** | **Pickup does not check the hold expiry.** `confirm_pickup` inspects status only (`app/crud.py:179-190`). | A lapsed reservation can be redeemed in the window between expiry and the next sweep. | FR-9.7 | **High** |
-| **7** | **No cancellation path.** `CANCELLED` is defined and unreachable (`app/models.py:41`). | An organization that knows it cannot collect cannot release the food early. | FR-8.11 | **High** |
-| **8** | **No scheduled pickup time.** Only a hold expiry exists. | Staff have no idea when to expect anyone. | FR-8.6, `Reservation.scheduled_pickup_at` | **High** |
+| ~~**6**~~ | ~~**Pickup does not check the hold expiry.**~~ **Closed.** `confirm_pickup` now compares against `hold_expires_at` and releases the item on a lapsed scan. | — | FR-9.7 | ✅ |
+| ~~**7**~~ | ~~**No cancellation path.**~~ **Closed.** `POST /reservations/{id}/cancel`. | — | FR-8.11 | ✅ |
+| ~~**8**~~ | ~~**No scheduled pickup time.**~~ **Closed.** `Reservation.scheduled_pickup_at`, booked up to 24h ahead, drives the hold. Staff see a Pickup schedule card. | — | FR-8.6 | ✅ |
 | **9** | **No review queue interface.** Items enter `needs_review` with no path out but a raw status PATCH. | The human safeguard the confidence branch depends on has no interface, so it does not function. | FR-3.2, FR-3.3 | **High** |
-| **10** | **QR code is rendered as raw text** (`PantryPage.jsx:161`). | Nothing to scan; the pickup flow is manual transcription. | FR-9.3 | **Medium** |
+| ~~**10**~~ | ~~**QR code is rendered as raw text.**~~ **Closed.** Rendered with `QRCodeSVG` and read by the staff camera scanner (`BarcodeScanner` `mode="qr"`). | — | FR-9.3, FR-3.10 | ✅ |
 | **11** | **Two item states have no writer.** `near_expiry` and `expired_hold` are defined and never assigned. | Ambiguous model; readers cannot tell whether the states are meaningful. | FR-6.4, FR-6.5 | **Medium** |
 | **12** | **State transitions are unvalidated.** Any status may be set from any other (`app/crud.py:83-90`). | A `picked_up` item can be returned to `available`. | FR-6.2 | **Medium** |
 | **13** | **Organization contact details are public.** `GET /pantries` returns EIN, phone, and email to any caller. | Discloses nonprofit contact data. | FR-7.9 | **Medium** |
 | **14** | **Vision API failure raises rather than degrading** (`app/ocr.py:72-73`). | An outage blocks stocking instead of routing to review. | FR-5.7 | **Medium** |
-| **15** | **No migrations, no tests, unpinned dependencies.** | Schema changes drop data; regressions go undetected; builds are not reproducible. | C-5, NFR-4.6.4, NFR-4.1.8 | **Medium** |
+| **15** | **No migrations; thin test coverage.** `scripts/upgrade_schema.py` is still a hand-rolled bridge, not Alembic. `backend/tests/` now covers reservation scheduling and pickup expiry; everything else is untested, and there is no frontend suite. | Schema changes risk data; regressions outside reservations go undetected. | C-5, NFR-4.6.4 | **Medium** |
 | **16** | **"Simulate OCR scan" ships in the client** with a hardcoded 0.97 confidence (`StorePage.jsx:144-151`). | A production user can fabricate a passing OCR result and auto-publish an unverified item. | FR-3.11 | **Medium** |
 
 ### Suggested Build Order
 
 **Phase 1 — Close the security gaps.** User model, login, role enforcement (FR-1, FR-2); move pickup confirmation to authenticated staff (FR-9.4); enforce the verification gate (FR-7.4, FR-7.5); fix the CORS allowlist. Nothing else should ship first — gaps 1, 2, and 3 make every other feature untrustworthy.
 
-**Phase 2 — Make the core flow correct.** Atomic reservation claim (FR-8.9); scheduled pickup time (FR-8.6); hold-expiry check at pickup (FR-9.7); cancellation (FR-8.11); a real scheduler (FR-10.2).
+**Phase 2 — Make the core flow correct.** ✅ **Complete.** Atomic reservation claim (FR-8.9); scheduled pickup time (FR-8.6); hold-expiry check at pickup (FR-9.7); cancellation (FR-8.11); a real scheduler (FR-10.2).
 
 **Phase 3 — Complete the interfaces.** Review queue (FR-3.2, FR-3.3); near-expiry view (FR-3.4); QR rendering and scanning (FR-9.3, FR-9.10); reservation listing (FR-8.10).
 
-**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); donation records (FR-11.1); Alembic; tests for the confidence branch, the hold window, and the expiry sweep.
+**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); donation records (FR-11.1); rescheduling a pickup time (FR-8.7); moving the pickup token out of the URL path (FR-9.9); Alembic; tests for the confidence branch and the expiry sweep.
 
 ---
 

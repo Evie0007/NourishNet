@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { api, parseUtc } from "../api";
+import { api, parseUtc, toLocalInputValue } from "../api";
 import { useAuth } from "../auth";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
+
+// Mirrors schemas.SCHEDULE_HORIZON and PICKUP_GRACE on the backend. The
+// server is authoritative — these only shape the control so it cannot
+// offer a value that would come back 422.
+const SCHEDULE_HORIZON_HOURS = 24;
+const GRACE_MINUTES = 30;
+
+// Shaved off the far edge so a picker left open for a few minutes does not
+// produce a time the server has since ruled out.
+const HORIZON_BUFFER_MINUTES = 5;
 
 export default function OrganizerDashboard() {
   const { user } = useAuth();
@@ -12,6 +22,9 @@ export default function OrganizerDashboard() {
   const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState("sell_by");
   const [category, setCategory] = useState("");
+  // Which row has its pickup-time picker open. One at a time — a list of
+  // half-filled forms is worse than a single focused one.
+  const [schedulingId, setSchedulingId] = useState(null);
 
   const verified = user?.pantry_verified === true;
 
@@ -47,13 +60,22 @@ export default function OrganizerDashboard() {
     );
   }, [available, category, sortBy]);
 
-  const active = reservations.filter((r) => r.status === "pending");
+  // Soonest pickup first — the API orders by when the reservation was
+  // made, which is not the order anyone collects in.
+  const active = reservations
+    .filter((r) => r.status === "pending")
+    .sort(
+      (a, b) =>
+        (parseUtc(a.scheduled_pickup_at)?.getTime() ?? Infinity) -
+        (parseUtc(b.scheduled_pickup_at)?.getTime() ?? Infinity),
+    );
   const past = reservations.filter((r) => r.status !== "pending");
 
-  async function reserve(itemId) {
+  async function reserve(itemId, scheduledLocal) {
     setError("");
     try {
-      await api.createReservation(itemId);
+      await api.createReservation(itemId, scheduledLocal);
+      setSchedulingId(null);
       await refresh();
     } catch (err) {
       setError(err.message);
@@ -127,26 +149,38 @@ export default function OrganizerDashboard() {
               ) : (
                 <ul className="divide-y divide-gray-100">
                   {visible.map((item) => (
-                    <li
-                      key={item.id}
-                      className="flex flex-wrap items-center justify-between gap-3 py-3"
-                    >
-                      {/* FR-8.2 */}
-                      <div className="min-w-0">
-                        <div className="font-medium">{item.name}</div>
-                        <div className="mt-0.5 text-xs text-gray-500">
-                          {item.category || "Uncategorized"} · sell-by{" "}
-                          {formatDate(item.sell_by_date)}
+                    <li key={item.id} className="py-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        {/* FR-8.2 */}
+                        <div className="min-w-0">
+                          <div className="font-medium">{item.name}</div>
+                          <div className="mt-0.5 text-xs text-gray-500">
+                            {item.category || "Uncategorized"} · sell-by{" "}
+                            {formatDate(item.sell_by_date)}
+                          </div>
                         </div>
+                        <button
+                          onClick={() =>
+                            setSchedulingId(schedulingId === item.id ? null : item.id)
+                          }
+                          disabled={!verified}
+                          aria-expanded={schedulingId === item.id}
+                          title={
+                            verified ? undefined : "Available once your organization is verified"
+                          }
+                          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                        >
+                          {schedulingId === item.id ? "Close" : "Reserve"}
+                        </button>
                       </div>
-                      <button
-                        onClick={() => reserve(item.id)}
-                        disabled={!verified}
-                        title={verified ? undefined : "Available once your organization is verified"}
-                        className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-                      >
-                        Reserve
-                      </button>
+
+                      {schedulingId === item.id && (
+                        <SchedulePicker
+                          item={item}
+                          onCancel={() => setSchedulingId(null)}
+                          onConfirm={(scheduledLocal) => reserve(item.id, scheduledLocal)}
+                        />
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -191,6 +225,106 @@ export default function OrganizerDashboard() {
   );
 }
 
+/**
+ * FR-8.6 — the organization commits to a time, and the hold follows from
+ * it rather than from the moment they clicked.
+ *
+ * The bounds are computed once on mount rather than on a ticking clock:
+ * re-deriving them every second would move the control's floor out from
+ * under a value the person had already chosen.
+ */
+function SchedulePicker({ item, onConfirm, onCancel }) {
+  const [value, setValue] = useState(() => toLocalInputValue(defaultSlot()));
+  const [problem, setProblem] = useState("");
+
+  const min = useMemo(() => toLocalInputValue(new Date()), []);
+
+  // The far edge is 24 hours out, or the moment the food has to leave the
+  // shelf, whichever comes first. Without the second bound an overnight
+  // booking on short-dated stock would be accepted here and then killed by
+  // the discard sweep before anyone arrived.
+  const discardAt = parseUtc(item.discard_after);
+  const max = useMemo(() => {
+    const horizon =
+      Date.now() + (SCHEDULE_HORIZON_HOURS * 60 - HORIZON_BUFFER_MINUTES) * 60_000;
+    const ceiling = discardAt ? Math.min(horizon, discardAt.getTime()) : horizon;
+    return toLocalInputValue(new Date(ceiling));
+  }, [discardAt]);
+
+  const cappedByDiscard = discardAt && discardAt.getTime() < Date.now() + SCHEDULE_HORIZON_HOURS * 3600_000;
+
+  function submit(e) {
+    e.preventDefault();
+    // min/max are advisory for typed input in some browsers, so check
+    // before spending a request. The server stays authoritative.
+    if (!value) return setProblem("Choose a pickup time.");
+    if (value < min) return setProblem("That time has already passed.");
+    if (value > max) {
+      return setProblem(
+        cappedByDiscard
+          ? "This item has to be off the shelf before then. Pick an earlier time."
+          : "Pickups can be booked up to 24 hours ahead.",
+      );
+    }
+    setProblem("");
+    onConfirm(value);
+  }
+
+  return (
+    <form onSubmit={submit} className="mt-3 rounded-lg bg-gray-50 p-3">
+      <label
+        htmlFor={`pickup-${item.id}`}
+        className="block text-xs font-medium text-gray-700"
+      >
+        When will you collect this?
+      </label>
+      <div className="mt-1.5 flex flex-wrap items-center gap-2">
+        <input
+          id={`pickup-${item.id}`}
+          type="datetime-local"
+          value={value}
+          min={min}
+          max={max}
+          step="300"
+          required
+          onChange={(e) => setValue(e.target.value)}
+          className="rounded-lg border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+        />
+        <button className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700">
+          Confirm reservation
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+        >
+          Cancel
+        </button>
+      </div>
+      <p className="mt-2 text-xs text-gray-500">
+        Book up to 24 hours ahead. The hold is released {GRACE_MINUTES} minutes
+        after your slot, and the item goes back into the pool.
+        {cappedByDiscard && (
+          <>
+            {" "}
+            This one has to be off the shelf by {formatDateTime(item.discard_after)}.
+          </>
+        )}
+      </p>
+      {problem && <p className="mt-1.5 text-xs font-medium text-amber-700">{problem}</p>}
+    </form>
+  );
+}
+
+/** The next half-hour boundary at least an hour out — the common case is
+ *  "later today", and a sensible default makes that one tap. */
+function defaultSlot() {
+  const d = new Date(Date.now() + 60 * 60_000);
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() > 30 ? 60 : 30);
+  return d;
+}
+
 function ReservationCard({ reservation, onCancel }) {
   const [remaining, setRemaining] = useState(() => timeLeft(reservation.hold_expires_at));
 
@@ -199,7 +333,10 @@ function ReservationCard({ reservation, onCancel }) {
     return () => clearInterval(id);
   }, [reservation.hold_expires_at]);
 
-  const urgent = remaining.totalMinutes <= 30;
+  // The hold is the slot plus a 30-minute grace, so "under 30 minutes
+  // left" now means precisely "the scheduled time has arrived or passed" —
+  // which is exactly when this card should start looking urgent.
+  const urgent = remaining.totalMinutes <= GRACE_MINUTES;
 
   return (
     <div className="rounded-lg border border-gray-200 p-4">
@@ -213,6 +350,15 @@ function ReservationCard({ reservation, onCancel }) {
         </div>
         <StatusBadge status={reservation.status} />
       </div>
+
+      {reservation.scheduled_pickup_at && (
+        <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+          Scheduled for{" "}
+          <span className="font-medium">
+            {formatDateTime(reservation.scheduled_pickup_at)}
+          </span>
+        </div>
+      )}
 
       {/* NFR-4.5.4: large and high-contrast — this gets read off a phone in
           store lighting. */}
@@ -233,7 +379,9 @@ function ReservationCard({ reservation, onCancel }) {
       >
         {remaining.expired
           ? "Hold window has lapsed — this item may have returned to the pool."
-          : `Collect within ${remaining.label} (by ${formatTime(reservation.hold_expires_at)})`}
+          : `${remaining.label} left to collect — the hold is released at ${formatTime(
+              reservation.hold_expires_at,
+            )}, ${GRACE_MINUTES} minutes after your slot.`}
       </div>
 
       <button

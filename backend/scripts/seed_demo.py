@@ -15,12 +15,13 @@ real partner data the moment someone reuses it.
 Safe to re-run: existing rows are updated in place, not duplicated.
 """
 import os
+import secrets
 import sys
 from datetime import datetime, timedelta
 
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
-from app import expiration, models, upc as upc_lib
+from app import expiration, models, schemas, upc as upc_lib
 
 # Real, check-digit-valid barcodes so the intake scanner can be demonstrated
 # by typing one of these into the UPC field. They are ordinary retail codes;
@@ -152,6 +153,7 @@ def main():
         # add it anyway, for a database that has shelves but nothing in a
         # demo-able state (e.g. every item already picked up).
         force_inventory = "--with-inventory" in sys.argv
+        demo_codes = []
         if db.query(models.Shelf).count() == 0 or force_inventory:
             print("Sample inventory:")
             now = datetime.utcnow()
@@ -185,8 +187,21 @@ def main():
                 ("Baby Spinach 5oz",     "PROD-118",  "Produce",2, models.ItemStatus.IN_STOCK,      26, "681131022217"),
                 ("Strawberries 1lb",     "PROD-092",  "Produce",2, models.ItemStatus.IN_STOCK,      40, None),
                 ("Cheddar Block 8oz",    "DAIRY-077", "Dairy",  0, models.ItemStatus.IN_STOCK,     400, "073731000106"),
+                # Already spoken for — these back the three reservations
+                # below, so the staff Pickup schedule and the organizer's
+                # QR code both have something to show on first load.
+                #
+                # Their sell-by is deliberately generous. sweep() moves any
+                # RESERVED item past its discard_after to EXPIRED_HOLD, so a
+                # short-dated item here would empty the schedule card within
+                # a minute of seeding and look like a bug in the feature
+                # rather than a correctly-working safety rule.
+                ("Butter 1lb",           "DAIRY-031", "Dairy",  0, models.ItemStatus.RESERVED,      48, None),
+                ("Heavy Cream 1qt",      "DAIRY-052", "Dairy",  0, models.ItemStatus.RESERVED,      60, None),
+                ("Bagels 6ct",           "BAKE-011",  "Bakery", 1, models.ItemStatus.PICKED_UP,     36, None),
             ]
             rules = expiration.load_rules(db)
+            created_items = {}
             for name, sku, category, shelf_idx, item_status, hours, upc in items:
                 code = upc_lib.normalize(upc) if upc else None
                 product = upc_lib.find_product(db, code) if code else None
@@ -217,7 +232,45 @@ def main():
                 # it — and the demo would look broken for the wrong reason.
                 expiration.apply_rules_to_item(db, item, rules=rules)
                 db.add(item)
+                created_items[name] = item
+            db.flush()
             print(f"  created: {len(shelves)} shelves, {len(items)} items")
+
+            # Three reservations so both dashboards have real state on
+            # first load: one pickup later today, one tomorrow to exercise
+            # the 24-hour horizon, and one already collected so the status
+            # column and the organizer's History card are not single-valued.
+            #
+            # Built directly rather than through crud.create_reservation,
+            # for the same reason the items above are: that function
+            # validates and commits a live request, and the collected one
+            # could not be expressed through it at all.
+            reservations = [
+                ("Butter 1lb",      now + timedelta(hours=3),  models.ReservationStatus.PENDING),
+                ("Heavy Cream 1qt", now + timedelta(hours=20), models.ReservationStatus.PENDING),
+                ("Bagels 6ct",      now - timedelta(hours=2),  models.ReservationStatus.PICKED_UP),
+            ]
+            for item_name, scheduled, res_status in reservations:
+                code = secrets.token_urlsafe(16)
+                db.add(
+                    models.Reservation(
+                        item_id=created_items[item_name].id,
+                        pantry_id=pantry.id,
+                        status=res_status,
+                        reserved_at=now - timedelta(hours=1),
+                        scheduled_pickup_at=scheduled,
+                        hold_expires_at=scheduled + schemas.PICKUP_GRACE,
+                        qr_code=code,
+                        picked_up_at=(
+                            scheduled + timedelta(minutes=15)
+                            if res_status == models.ReservationStatus.PICKED_UP
+                            else None
+                        ),
+                    )
+                )
+                if res_status == models.ReservationStatus.PENDING:
+                    demo_codes.append((item_name, code))
+            print(f"  created: {len(reservations)} reservations")
 
             # One scan left mid-flow, so the Intake tab has something in its
             # confirmation queue on first load: a barcode that resolved, a
@@ -264,6 +317,14 @@ def main():
         print("\nDone. Sign in at the login page with:")
         print(f"  Staff      {STAFF_EMAIL}")
         print(f"  Organizer  {ORG_EMAIL}")
+
+        if demo_codes:
+            # So the pickup scanner can be exercised without signing in as
+            # the organizer on a second device. These are throwaway tokens
+            # against a demo database, regenerated on every seed.
+            print("\nPending pickup codes (demo only):")
+            for item_name, code in demo_codes:
+                print(f"  {item_name:<20} {code}")
     finally:
         db.close()
 

@@ -4,9 +4,11 @@ the SQLAlchemy models in models.py. Keeping them separate means we can
 change the DB schema without automatically changing what the app/OCR
 pipeline sends and receives, and vice versa.
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from pydantic import BaseModel, EmailStr, ConfigDict, Field
+from pydantic import (
+    AwareDatetime, BaseModel, EmailStr, ConfigDict, Field, field_validator, model_validator
+)
 
 from .models import (
     DateLabelType, DateSource, ItemStatus, ReservationStatus, ScanStatus, UserRole
@@ -341,13 +343,70 @@ class PantryOut(BaseModel):
 
 # ---------- Reservation ----------
 
+# The hold used to be a flat window from the moment someone clicked Reserve,
+# which told staff nothing about when anyone would actually arrive. Now the
+# organization states a slot and the hold is derived from it. These three
+# constants are the whole policy; crud.py imports them rather than
+# re-deriving the arithmetic.
+
+# How long after the promised slot the item stays held. A no-show frees the
+# food half an hour after the time they gave us, not hours after they
+# happened to click.
+PICKUP_GRACE = timedelta(minutes=30)
+
+# How far ahead a slot may be booked. Longer means an item sits RESERVED and
+# invisible to every other organization for that long.
+SCHEDULE_HORIZON = timedelta(hours=24)
+
+# Absorbs clock drift between the organizer's browser and this server, plus
+# the round trip. Without it, someone who picks "in one minute" and takes
+# ninety seconds to submit is rejected for a reason they cannot see.
+SUBMIT_SKEW = timedelta(minutes=2)
+
+
 class ReservationCreate(BaseModel):
     """Note the absence of pantry_id: FR-2.3 requires the acting
     organization to come from the authenticated user's account, never from
     the request body. Accepting it here would let any coordinator reserve
     food in another organization's name."""
     item_id: str
-    hold_minutes: int = 180  # default 3-hour holding window, per Section 13.3
+
+    # AwareDatetime, not datetime. A naive value means a browser sent local
+    # wall time without converting it, and reading that as UTC is a
+    # seven-hour error in California that surfaces much later as a hold that
+    # lapsed before it started. Requiring the offset turns a silent
+    # wrong-answer bug into a loud 422 on the first request.
+    scheduled_pickup_at: AwareDatetime
+
+    @field_validator("scheduled_pickup_at")
+    @classmethod
+    def _to_naive_utc(cls, value: datetime) -> datetime:
+        """Every DateTime column in this application is naive UTC. Normalize
+        at the edge so nothing downstream has to know which convention the
+        value it is holding came in as."""
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    @model_validator(mode="after")
+    def _within_booking_window(self):
+        """FR-8.6. Field validators run first, so both sides of these
+        comparisons are naive UTC.
+
+        The permitted boundary goes into the message on purpose: if the
+        browser's clock is wrong, the only way the person can tell is by
+        seeing the time this server thinks it is.
+        """
+        now = datetime.utcnow()
+        if self.scheduled_pickup_at < now - SUBMIT_SKEW:
+            raise ValueError(
+                "Pick a pickup time in the future — that one has already passed."
+            )
+        latest = now + SCHEDULE_HORIZON
+        if self.scheduled_pickup_at > latest + SUBMIT_SKEW:
+            raise ValueError(
+                "Pickups can be booked up to 24 hours ahead — choose a time before "
+                f"{latest.strftime('%Y-%m-%d %H:%M')} UTC."
+            )
+        return self
 
 
 class ReservationOut(BaseModel):
@@ -357,6 +416,9 @@ class ReservationOut(BaseModel):
     pantry_id: str
     status: ReservationStatus
     reserved_at: datetime
+    # Optional because reservations that predate scheduling keep NULL rather
+    # than being back-dated with an invented time (see upgrade_schema.py).
+    scheduled_pickup_at: Optional[datetime]
     hold_expires_at: datetime
     qr_code: Optional[str]
     picked_up_at: Optional[datetime]

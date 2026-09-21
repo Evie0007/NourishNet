@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, parseUtc } from "../api";
+import BarcodeScanner from "../components/BarcodeScanner";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
 import Intake from "./Intake";
 
@@ -20,20 +21,23 @@ export default function StaffDashboard() {
   const [items, setItems] = useState([]);
   const [shelves, setShelves] = useState([]);
   const [nearExpiry, setNearExpiry] = useState([]);
+  const [reservations, setReservations] = useState([]);
   const [error, setError] = useState("");
   const [tab, setTab] = useState("overview");
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const [i, s, n] = await Promise.all([
+      const [i, s, n, r] = await Promise.all([
         api.listItems(),
         api.listShelves(),
         api.listNearExpiry(48),
+        api.allReservations(),
       ]);
       setItems(i);
       setShelves(s);
       setNearExpiry(n);
+      setReservations(r);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -102,6 +106,7 @@ export default function StaffDashboard() {
             <Overview
               counts={counts}
               nearExpiry={nearExpiry}
+              reservations={reservations}
               shelves={shelves}
               shelfName={shelfName}
               onError={setError}
@@ -134,7 +139,34 @@ const SUMMARY_ORDER = [
   ["discarded", "Discarded"],
 ];
 
-function Overview({ counts, nearExpiry, shelves, shelfName, onError, onChanged }) {
+function Overview({ counts, nearExpiry, reservations, shelves, shelfName, onError, onChanged }) {
+  // Scan state lives here, not in either card, because both the Confirm
+  // pickup button and the Pickup schedule button open the same camera.
+  // Two mounted scanners would mean two getUserMedia calls, and on a
+  // single-camera laptop the second one fails with NotReadableError.
+  const [scanOpen, setScanOpen] = useState(false);
+  const [outcome, setOutcome] = useState(null);
+
+  const confirm = useCallback(
+    async (code) => {
+      onError("");
+      setOutcome(null);
+      try {
+        const reservation = await api.confirmPickup(String(code).trim());
+        setScanOpen(false);
+        setOutcome({ ok: true, reservation });
+        onChanged();
+      } catch (err) {
+        // Kept in the card rather than only in the page-level banner: a
+        // staff member holding a phone at the shelf is looking at the
+        // scanner, not above the fold.
+        setScanOpen(false);
+        setOutcome({ ok: false, message: err.message });
+      }
+    },
+    [onError, onChanged],
+  );
+
   return (
     <div className="space-y-6">
       {/* FR-3.1 */}
@@ -147,31 +179,61 @@ function Overview({ counts, nearExpiry, shelves, shelfName, onError, onChanged }
         ))}
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <PickupScan onError={onError} onChanged={onChanged} />
+      <div className="grid gap-6 lg:grid-cols-3">
+        <PickupScan
+          outcome={outcome}
+          scanOpen={scanOpen}
+          onScan={() => {
+            setOutcome(null);
+            setScanOpen((open) => !open);
+          }}
+          onConfirmCode={confirm}
+        />
 
-        {/* FR-3.4 — the backend endpoint existed all along, unused. */}
-        <Card title="Near expiry (next 48h)">
-          {nearExpiry.length === 0 ? (
-            <Empty>Nothing approaching its sell-by date.</Empty>
-          ) : (
-            <ul className="divide-y divide-gray-100">
-              {nearExpiry.map((item) => (
-                <li key={item.id} className="flex items-center justify-between gap-3 py-2 text-sm">
-                  <div>
-                    <div className="font-medium">{item.name}</div>
-                    <div className="text-xs text-gray-500">{shelfName(item.shelf_id)}</div>
-                  </div>
-                  <div className="text-right text-xs text-gray-600">
-                    <div>{formatDate(item.sell_by_date)}</div>
-                    <div className="text-gray-400">{relativeTo(item.sell_by_date)}</div>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Card>
+        <div className="lg:col-span-2">
+          <PickupSchedule
+            reservations={reservations}
+            scanOpen={scanOpen}
+            onScan={() => {
+              setOutcome(null);
+              setScanOpen((open) => !open);
+            }}
+          />
+        </div>
       </div>
+
+      {/* One scanner for both buttons, full width because a 320px-tall
+          video does not belong in a narrow grid column. Unmounted rather
+          than hidden, so the camera light actually goes off. */}
+      {scanOpen && (
+        <BarcodeScanner
+          mode="qr"
+          onDetected={confirm}
+          onClose={() => setScanOpen(false)}
+        />
+      )}
+
+      {/* FR-3.4 — the backend endpoint existed all along, unused. */}
+      <Card title="Near expiry (next 48h)">
+        {nearExpiry.length === 0 ? (
+          <Empty>Nothing approaching its sell-by date.</Empty>
+        ) : (
+          <ul className="divide-y divide-gray-100">
+            {nearExpiry.map((item) => (
+              <li key={item.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+                <div>
+                  <div className="font-medium">{item.name}</div>
+                  <div className="text-xs text-gray-500">{shelfName(item.shelf_id)}</div>
+                </div>
+                <div className="text-right text-xs text-gray-600">
+                  <div>{formatDate(item.sell_by_date)}</div>
+                  <div className="text-gray-400">{relativeTo(item.sell_by_date)}</div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
 
       {/* FR-3.6 */}
       <Card title="Shelf conditions">
@@ -213,25 +275,28 @@ function ShelfConditionCard({ shelf }) {
   );
 }
 
-/* ---------------- Pickup (FR-9.4, FR-9.10) ---------------- */
+/* ---------------- Pickup (FR-3.10, FR-9.4, FR-9.10) ---------------- */
 
-function PickupScan({ onError, onChanged }) {
+/**
+ * Camera first, keyboard second.
+ *
+ * The code is already a QR on the organizer's phone, so typing out
+ * twenty-two base64 characters at the shelf was work nobody needed to do.
+ * Manual entry stays, folded away: a dead phone battery, a cracked lens or
+ * a browser without camera permission must not be able to block a handoff
+ * (FR-9.10).
+ */
+function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
+  const [manualOpen, setManualOpen] = useState(false);
   const [code, setCode] = useState("");
-  const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
 
   async function handleSubmit(e) {
     e.preventDefault();
-    onError("");
-    setResult(null);
     setBusy(true);
     try {
-      const reservation = await api.confirmPickup(code.trim());
-      setResult(reservation);
+      await onConfirmCode(code);
       setCode("");
-      onChanged();
-    } catch (err) {
-      onError(err.message);
     } finally {
       setBusy(false);
     }
@@ -240,32 +305,149 @@ function PickupScan({ onError, onChanged }) {
   return (
     <Card title="Confirm pickup">
       <p className="mb-3 text-sm text-gray-500">
-        Scan or type the code from the organizer's phone. Staff confirm the
-        handoff — the pantry cannot confirm its own.
+        Scan the QR code on the organizer's phone. Staff confirm the handoff —
+        the pantry cannot confirm its own.
       </p>
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          required
-          placeholder="Pickup code"
-          aria-label="Pickup code"
-          className="flex-1 rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
-        />
-        <button
-          disabled={busy}
-          className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
-        >
-          {busy ? "…" : "Confirm"}
-        </button>
-      </form>
-      {result && (
+
+      <button
+        type="button"
+        onClick={onScan}
+        aria-expanded={scanOpen}
+        className="w-full rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+      >
+        {scanOpen ? "Close camera" : "Scan QR code"}
+      </button>
+
+      {outcome?.ok && (
         <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
-          Collected: <span className="font-medium">{result.item_name}</span> by{" "}
-          {result.pantry_name} at {formatTime(result.picked_up_at)}.
+          Collected: <span className="font-medium">{outcome.reservation.item_name}</span>{" "}
+          by {outcome.reservation.pantry_name} at{" "}
+          {formatTime(outcome.reservation.picked_up_at)}.
         </div>
       )}
+      {outcome && !outcome.ok && (
+        <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          {outcome.message}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => setManualOpen((open) => !open)}
+        aria-expanded={manualOpen}
+        className="mt-3 text-xs font-medium text-gray-500 underline hover:text-gray-800"
+      >
+        {manualOpen ? "Hide manual entry" : "Can't scan? Enter code"}
+      </button>
+
+      {manualOpen && (
+        <form onSubmit={handleSubmit} className="mt-2 flex gap-2">
+          <input
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            required
+            placeholder="Pickup code"
+            aria-label="Pickup code"
+            className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+          />
+          <button
+            disabled={busy}
+            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+          >
+            {busy ? "…" : "Confirm"}
+          </button>
+        </form>
+      )}
     </Card>
+  );
+}
+
+/**
+ * What the store should expect at the shelf, and when (FR-8.10).
+ *
+ * Shows pending pickups plus anything resolved recently, so a manager who
+ * looks up a minute after a handoff still sees what happened rather than a
+ * row that silently vanished.
+ */
+const RESOLVED_VISIBLE_HOURS = 4;
+const SCHEDULE_ROW_LIMIT = 12;
+
+function PickupSchedule({ reservations, scanOpen, onScan }) {
+  const rows = useMemo(() => {
+    const cutoff = Date.now() - RESOLVED_VISIBLE_HOURS * 3600_000;
+    return reservations
+      .filter((r) => {
+        if (r.status === "pending") return true;
+        const resolved = parseUtc(r.picked_up_at || r.hold_expires_at);
+        return resolved ? resolved.getTime() >= cutoff : false;
+      })
+      .sort(
+        (a, b) =>
+          // Nulls last: a reservation predating scheduling has no slot to
+          // sort by, and guessing one would put it somewhere misleading.
+          (parseUtc(a.scheduled_pickup_at)?.getTime() ?? Infinity) -
+          (parseUtc(b.scheduled_pickup_at)?.getTime() ?? Infinity),
+      );
+  }, [reservations]);
+
+  const shown = rows.slice(0, SCHEDULE_ROW_LIMIT);
+
+  return (
+    <Card
+      title="Pickup schedule"
+      action={
+        <button
+          type="button"
+          onClick={onScan}
+          aria-expanded={scanOpen}
+          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700"
+        >
+          {scanOpen ? "Close camera" : "Scan QR code"}
+        </button>
+      }
+    >
+      {shown.length === 0 ? (
+        <Empty>No pickups scheduled.</Empty>
+      ) : (
+        <>
+          <ul className="divide-y divide-gray-100">
+            {shown.map((r) => (
+              <ScheduleRow key={r.id} reservation={r} />
+            ))}
+          </ul>
+          {rows.length > shown.length && (
+            <p className="mt-2 text-xs text-gray-500">
+              +{rows.length - shown.length} more scheduled.
+            </p>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+function ScheduleRow({ reservation }) {
+  const slot = parseUtc(reservation.scheduled_pickup_at);
+  // The point of the card for a manager: who was due and hasn't turned up.
+  const overdue = reservation.status === "pending" && slot && slot.getTime() < Date.now();
+
+  return (
+    <li
+      className={`flex flex-wrap items-center justify-between gap-3 py-2 text-sm ${
+        overdue ? "bg-amber-50" : ""
+      }`}
+    >
+      <div className="min-w-0">
+        <div className={`font-medium ${overdue ? "text-amber-900" : ""}`}>
+          {slot ? formatDateTime(reservation.scheduled_pickup_at) : "Not scheduled"}
+          {overdue && <span className="ml-2 text-xs font-normal">· overdue</span>}
+        </div>
+        <div className="mt-0.5 truncate text-xs text-gray-500">
+          {reservation.item_name} · {reservation.pantry_name}
+        </div>
+      </div>
+      <StatusBadge status={reservation.status} />
+    </li>
   );
 }
 
@@ -906,6 +1088,18 @@ function formatDate(value) {
 function formatTime(value) {
   const d = parseUtc(value);
   return d ? d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "—";
+}
+
+/** Day and time together, for the pickup schedule — a bare time is
+ *  ambiguous once bookings can be up to 24 hours out. */
+function formatDateTime(value) {
+  const d = parseUtc(value);
+  if (!d) return "—";
+  const today = new Date().toDateString() === d.toDateString();
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return today
+    ? `Today ${time}`
+    : `${d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} ${time}`;
 }
 
 function toDateInput(value) {
