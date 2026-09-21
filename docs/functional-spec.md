@@ -67,7 +67,7 @@ NourishNet reduces grocery-retail food waste by automating the path from "this i
 | **Item** | A single physical unit or batch of a product on a shelf, tracked individually through its lifecycle. |
 | **OCR** | Optical character recognition — extracting machine-readable text from a photograph of a product label. |
 | **Organization / Pantry** | A nonprofit food pantry or similar entity that receives donations. Used interchangeably; `Pantry` is the entity name in code. |
-| **Scheduled pickup time** | The specific time within the hold window at which the organization commits to arrive. |
+| **Scheduled pickup time** | The time at which the organization commits to arrive. It is chosen first and the hold window is derived from it, not the other way round — see FR-8.6. |
 | **Sell-by date** | The date by which a retailer should sell or remove a product. **Not** a safety deadline. |
 | **SKU** | Stock Keeping Unit — the store's internal product identifier. |
 | **Use-by date** | The manufacturer's estimate of peak quality, and for a small class of products (e.g. infant formula) a safety limit. |
@@ -372,12 +372,20 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 | **FR-8.4** | An organization MUST be able to reserve an `available` item, which MUST make that item unavailable to every other organization immediately. | Must | ✅ *(`app/crud.py:139-151`)* |
 | **FR-8.5** | ~~Reserving MUST start a hold window, defaulting to 180 minutes and configurable per request.~~ **Superseded by FR-8.6.** The hold is no longer independent of the pickup time, and no longer configurable per request: it is always `scheduled_pickup_at + 30 minutes`. A flat window from the moment of the click told staff nothing about when anyone would arrive, and left a no-show's item tied up for the balance of three hours. | Must | ⊘ superseded |
 | **FR-8.6** | When reserving, the organization MUST select a **scheduled pickup time** at or after the current time and no more than **24 hours** ahead, and no later than the item's `discard_after`. The hold MUST be derived as `scheduled_pickup_at + 30 minutes`. A time outside the permitted range MUST be rejected with 422, and the message MUST name the boundary that was exceeded. | Must | ✅ *(`app/schemas.py` `ReservationCreate`, `PICKUP_GRACE`/`SCHEDULE_HORIZON`; the `discard_after` ceiling in `crud.create_reservation`)* |
-| **FR-8.7** | An organization MUST be able to change its scheduled pickup time while the reservation is `pending`, subject to the same range constraint. ~~Changing the pickup time MUST NOT extend the hold window.~~ The struck clause is now unsatisfiable by construction: the hold **is** a function of the pickup time, so rescheduling necessarily moves it. Restate as *"rescheduling MUST NOT push `hold_expires_at` beyond `reserved_at + 24h`"* before building this. | Should | ○ *(not implemented; cancel and re-reserve is the workaround)* |
+| **FR-8.7** | An organization MUST be able to change the scheduled pickup time of its own `pending` reservation. The new time MUST satisfy the same bounds as a first booking — at or after the current time, and no later than the item's `discard_after`, which MUST be re-checked because a rules change can move it earlier. It MUST additionally fall no later than **`reserved_at` + 24 hours**, and that ceiling MUST be anchored to `reserved_at` rather than to the moment of the change. The hold is then re-derived as `scheduled_pickup_at + 30 minutes`. A time outside the permitted range MUST be rejected with 422, naming the boundary exceeded, and MUST leave the existing reservation untouched. | Should | ○ *(not implemented; cancel and re-reserve is the workaround)* |
 | **FR-8.8** | Reserving an item not in `available` MUST return 409 with a message distinguishing "already reserved" from "not yet eligible." | Must | ◐ *(409 returned with a combined message: `app/routers/reservations.py:19-22`)* |
 | **FR-8.9** | Concurrent reservation attempts on the same item MUST result in exactly one success; the loser MUST receive 409. The check-and-claim MUST be atomic. | Must | ○ **← race condition**, see [NFR-4.7](#47-data-integrity) |
 | **FR-8.10** | An organization MUST be able to view its own reservations, filtered by status, showing item, scheduled pickup time, hold expiry, and QR code. | Must | ✅ *(`GET /reservations/mine`; `OrganizerDashboard.jsx` `ReservationCard`)* |
-| **FR-8.11** | An organization MUST be able to cancel its own `pending` reservation, which MUST return the item to `available` immediately. | Must | ○ *(`CANCELLED` is defined at `app/models.py:41` but is unreachable — no code sets it)* |
+| **FR-8.11** | An organization MUST be able to cancel its own `pending` reservation, which MUST return the item to `available` immediately. | Must | ✅ *(`POST /reservations/{id}/cancel` → `crud.cancel_reservation`; 404 rather than 403 for another org's reservation, per FR-2.4)* |
 | **FR-8.12** | The system MUST warn an organization approaching its hold expiry with an uncollected reservation, at a configurable lead time. | Could | ○ |
+
+> **Note on FR-8.7 — why the ceiling is anchored to `reserved_at`.**
+>
+> This requirement previously read *"changing the pickup time MUST NOT extend the hold window."* Once the hold became a function of the pickup time (FR-8.6), that sentence could not be satisfied by any implementation: moving the slot necessarily moves the hold. It was superseded rather than deleted, because the thing it was protecting against is still real.
+>
+> That thing is an indefinite hold. If the 24-hour ceiling were measured from the moment of each change rather than from `reserved_at`, an organization could reserve a scarce item and then, shortly before each deadline, push the slot another 24 hours out — holding it out of every other organization's reach for as long as it liked, without ever collecting it or being expired by the sweep. Anchoring to `reserved_at` caps the total exclusive hold at 24 hours no matter how many times the slot is changed, which is exactly what the superseded clause was for.
+>
+> An organization that genuinely needs longer should cancel and re-reserve, which puts the item back in the pool first and gives everyone else a fair chance at it. That is also the current workaround, since this requirement is not yet built.
 
 *Verification:* Reserve as a verified organization and confirm the item leaves the available pool. Submit a `scheduled_pickup_at` in the past, one more than 24 hours ahead, and one past the item's `discard_after`; confirm all three are rejected with 422 and that the item is not left stranded in `reserved`. Submit a naive datetime and confirm it is rejected rather than read as UTC. Confirm `hold_expires_at` lands exactly 30 minutes after the accepted slot. Fire two simultaneous reservations at one item and confirm exactly one succeeds. Cancel and confirm the item returns. Covered by `backend/tests/test_reservation_scheduling.py`.
 
@@ -1401,7 +1409,7 @@ Base URL: `http://localhost:8000` in development. All request and response bodie
 | `GET` | `/reservations` | Bearer | staff, manager, admin | `?status=` | `[ReservationDetailOut]` | ✅ *(store-wide; backs the Pickup schedule card)* |
 | `GET` | `/reservations/mine` | Bearer | org_coordinator | `?status=` | `[ReservationDetailOut]` | ✅ *(FR-8.10; scoped to the caller's org)* |
 | `GET` | `/reservations/{id}` | Bearer | owner org; staff, manager | — | `ReservationOut` · 404 | ○ |
-| `PATCH` | `/reservations/{id}` | Bearer | owner org | `{scheduled_pickup_at}` | `ReservationOut` · 422 | ○ *(FR-8.7)* |
+| `PATCH` | `/reservations/{id}` | Bearer | owner org | `{scheduled_pickup_at}` — offset-aware | `ReservationDetailOut` · 404 not-yours · 409 not pending · 422 outside `[now, min(reserved_at + 24h, discard_after)]` | ○ *(FR-8.7)* |
 | `DELETE` | `/reservations/{id}` | Bearer | owner org; manager | — | `ReservationOut` (cancelled) · 409 | ✅ *(FR-8.11 — shipped as `POST /reservations/{id}/cancel`, 404 not 403 per FR-2.4)* |
 | `POST` | `/reservations/pickup` | Bearer | **staff, manager** | `{token}` in body | `ReservationDetailOut` · 404 · 409 with reason | ◐ **← staff-only and reason-differentiated now; still `POST /reservations/pickup/{qr_code}` with the token in the URL path (FR-9.9)** |
 | `POST` | `/reservations/expire-stale` | Bearer | manager, admin | — | `[ReservationOut]` | ✅ *(FR-10.5; the scheduler also runs it every 60s)* |
@@ -1496,11 +1504,11 @@ Ordered by severity. This doubles as a build backlog.
 
 **Phase 1 — Close the security gaps.** User model, login, role enforcement (FR-1, FR-2); move pickup confirmation to authenticated staff (FR-9.4); enforce the verification gate (FR-7.4, FR-7.5); fix the CORS allowlist. Nothing else should ship first — gaps 1, 2, and 3 make every other feature untrustworthy.
 
-**Phase 2 — Make the core flow correct.** Atomic reservation claim (FR-8.9); scheduled pickup time (FR-8.6); hold-expiry check at pickup (FR-9.7); cancellation (FR-8.11); a real scheduler (FR-10.2).
+**Phase 2 — Make the core flow correct.** ✅ **Complete.** Atomic reservation claim (FR-8.9); scheduled pickup time (FR-8.6); hold-expiry check at pickup (FR-9.7); cancellation (FR-8.11); a real scheduler (FR-10.2).
 
 **Phase 3 — Complete the interfaces.** Review queue (FR-3.2, FR-3.3); near-expiry view (FR-3.4); QR rendering and scanning (FR-9.3, FR-9.10); reservation listing (FR-8.10).
 
-**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); donation records (FR-11.1); Alembic; tests for the confidence branch, the hold window, and the expiry sweep.
+**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); donation records (FR-11.1); rescheduling a pickup time (FR-8.7); moving the pickup token out of the URL path (FR-9.9); Alembic; tests for the confidence branch and the expiry sweep.
 
 ---
 
