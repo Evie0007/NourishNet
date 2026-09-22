@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import expiration, scheduler
 from .database import Base, SessionLocal, engine
-from .routers import auth, catalog, intake, items, shelves, pantries, reservations
+from .routers import auth, catalog, intake, items, shelves, pantries, reservations, reports
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -72,6 +72,7 @@ app.include_router(items.router)
 app.include_router(shelves.router)
 app.include_router(pantries.router)
 app.include_router(reservations.router)
+app.include_router(reports.router)
 
 
 @app.get("/health")

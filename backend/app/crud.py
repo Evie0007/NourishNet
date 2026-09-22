@@ -76,6 +76,7 @@ def create_item(db: Session, item: schemas.ItemCreate) -> models.Item:
             # person typed wins over what the barcode knows.
             data["category"] = data.get("category") or product.category
             data["sku"] = data.get("sku") or product.sku
+            data["unit_value"] = data.get("unit_value") or product.unit_value
 
     db_item = models.Item(**data)
     if db_item.arrival_date is None:
@@ -417,6 +418,7 @@ def confirm_intake_scan(
             product_id=db_scan.product_id,
             batch_id=batch_id,
             category=category,
+            unit_value=product.unit_value if product else None,
             sell_by_date=sell_by,
             use_by_date=use_by,
             date_label_type=label_type,
@@ -648,7 +650,9 @@ def expire_stale_reservations(db: Session):
     return stale
 
 
-def confirm_pickup(db: Session, qr_code: str) -> tuple[Optional[models.Reservation], str]:
+def confirm_pickup(
+    db: Session, qr_code: str, confirmed_by_user_id: str
+) -> tuple[Optional[models.Reservation], str]:
     """
     Redeems a pickup token at the shelf. Returns (reservation, outcome);
     outcomes are "ok", "not_found", "expired", "already_picked_up" and
@@ -694,6 +698,45 @@ def confirm_pickup(db: Session, qr_code: str) -> tuple[Optional[models.Reservati
     item = db.get(models.Item, db_res.item_id)
     if item:
         item.status = models.ItemStatus.PICKED_UP
+    pantry = db.get(models.Pantry, db_res.pantry_id)
+
+    # The immutable donation record (FR-11.1) — written once, here, and
+    # never touched again. Fields are copied rather than joined live so
+    # this row still reads correctly after the Item or Pantry it points to
+    # is later edited.
+    db.add(models.DonationRecord(
+        reservation_id=db_res.id,
+        item_name=item.name if item else "",
+        item_sku=item.sku if item else None,
+        item_category=item.category if item else None,
+        sell_by_date_at_handoff=item.sell_by_date if item else None,
+        unit_value_at_handoff=item.unit_value if item else None,
+        pantry_id=db_res.pantry_id,
+        pantry_name_at_handoff=pantry.org_name if pantry else "",
+        confirmed_by_user_id=confirmed_by_user_id,
+        confirmed_at=db_res.picked_up_at,
+    ))
+
     db.commit()
     db.refresh(db_res)
     return db_res, "ok"
+
+
+# ---------- Donation records (FR-11.1) ----------
+
+def list_donation_records(
+    db: Session,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    pantry_id: Optional[str] = None,
+):
+    """The donation history a business pulls at tax time. Newest first, so
+    the most recent filing period is what shows up without scrolling."""
+    q = db.query(models.DonationRecord)
+    if date_from:
+        q = q.filter(models.DonationRecord.confirmed_at >= date_from)
+    if date_to:
+        q = q.filter(models.DonationRecord.confirmed_at <= date_to)
+    if pantry_id:
+        q = q.filter(models.DonationRecord.pantry_id == pantry_id)
+    return q.order_by(models.DonationRecord.confirmed_at.desc()).all()
