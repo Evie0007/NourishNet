@@ -5,6 +5,7 @@ change the DB schema without automatically changing what the app/OCR
 pipeline sends and receives, and vice versa.
 """
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 from pydantic import (
     AwareDatetime, BaseModel, EmailStr, ConfigDict, Field, field_validator, model_validator
@@ -81,6 +82,9 @@ class ItemCreate(BaseModel):
     arrival_date: Optional[datetime] = None
     shelf_id: Optional[str] = None
     image_url: Optional[str] = None
+    # Usually left unset and inherited from the matched Product at creation
+    # (crud.py) — set here only to override the catalog value for this unit.
+    unit_value: Optional[Decimal] = None
 
 
 class ItemStatusUpdate(BaseModel):
@@ -115,6 +119,7 @@ class ItemOut(BaseModel):
     discard_after: Optional[datetime] = None
     arrival_date: Optional[datetime]
     shelf_id: Optional[str]
+    unit_value: Optional[Decimal] = None
     status: ItemStatus
     ocr_raw_text: Optional[str]
     ocr_confidence: Optional[float]
@@ -134,6 +139,9 @@ class ProductBase(BaseModel):
     default_shelf_life_days: Optional[int] = Field(default=None, ge=0, le=3650)
     date_label_type: DateLabelType = DateLabelType.SELL_BY
     donation_restricted: bool = False
+    # Per-unit value used to value a donated unit of this product for tax
+    # records (FR-11.1). Left unset for a product with no known value.
+    unit_value: Optional[Decimal] = Field(default=None, ge=0)
 
 
 class ProductCreate(ProductBase):
@@ -151,6 +159,7 @@ class ProductUpdate(BaseModel):
     default_shelf_life_days: Optional[int] = Field(default=None, ge=0, le=3650)
     date_label_type: Optional[DateLabelType] = None
     donation_restricted: Optional[bool] = None
+    unit_value: Optional[Decimal] = Field(default=None, ge=0)
 
 
 class ProductOut(ProductBase):
@@ -432,3 +441,23 @@ class ReservationDetailOut(ReservationOut):
     item_sell_by_date: Optional[datetime] = None
     shelf_name: Optional[str] = None
     pantry_name: Optional[str] = None
+
+
+# ---------- Donation records (FR-11.1) ----------
+
+class DonationRecordOut(BaseModel):
+    """The immutable snapshot written when a pickup is confirmed. There is
+    deliberately no Create/Update schema — nothing ever writes to this table
+    except crud.confirm_pickup, and nothing edits or deletes a row after."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    reservation_id: str
+    item_name: str
+    item_sku: Optional[str]
+    item_category: Optional[str]
+    sell_by_date_at_handoff: Optional[datetime]
+    unit_value_at_handoff: Optional[Decimal]
+    pantry_id: str
+    pantry_name_at_handoff: str
+    confirmed_by_user_id: str
+    confirmed_at: datetime

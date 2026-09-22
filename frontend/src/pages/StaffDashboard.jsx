@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, parseUtc } from "../api";
+import { api, formatCurrency, parseUtc } from "../api";
 import BarcodeScanner from "../components/BarcodeScanner";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
 import Intake from "./Intake";
@@ -11,6 +11,7 @@ const TABS = [
   { key: "inventory", label: "Inventory" },
   { key: "rules", label: "Expiration rules" },
   { key: "shelves", label: "Shelves" },
+  { key: "donations", label: "Donation report" },
 ];
 
 /** Reading older than this means the sensor or its network is down, not
@@ -122,6 +123,7 @@ export default function StaffDashboard() {
           )}
           {tab === "rules" && <ExpirationRules onError={setError} onChanged={refresh} />}
           {tab === "shelves" && <Shelves shelves={shelves} onError={setError} onChanged={refresh} />}
+          {tab === "donations" && <DonationReport onError={setError} />}
         </>
       )}
     </Shell>
@@ -595,7 +597,7 @@ function ReviewCard({ item, shelfName, onError, onChanged }) {
 function Inventory({ items, shelves, shelfName, onError, onChanged }) {
   const [filter, setFilter] = useState("");
   const [shelfFilter, setShelfFilter] = useState("");
-  const [form, setForm] = useState({ name: "", sku: "", category: "", shelf_id: "", sell_by_date: "" });
+  const [form, setForm] = useState({ name: "", sku: "", category: "", shelf_id: "", sell_by_date: "", unit_value: "" });
   const [busy, setBusy] = useState(false);
 
   const visible = items.filter(
@@ -615,8 +617,11 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
         sell_by_date: form.sell_by_date
           ? new Date(`${form.sell_by_date}T00:00:00Z`).toISOString()
           : null,
+        // Left blank, this inherits the matched product's catalog value
+        // instead (crud.create_item) — only set here to override it.
+        unit_value: form.unit_value === "" ? null : Number(form.unit_value),
       });
-      setForm({ name: "", sku: "", category: "", shelf_id: "", sell_by_date: "" });
+      setForm({ name: "", sku: "", category: "", shelf_id: "", sell_by_date: "", unit_value: "" });
       onChanged();
     } catch (err) {
       onError(err.message);
@@ -671,6 +676,18 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
               className={input}
               value={form.sell_by_date}
               onChange={(e) => setForm({ ...form, sell_by_date: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500">Unit value ($)</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="from catalog"
+              className={`${input} w-28`}
+              value={form.unit_value}
+              onChange={(e) => setForm({ ...form, unit_value: e.target.value })}
             />
           </div>
           <button
@@ -730,6 +747,7 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
                       status change that nobody could see coming is the thing
                       that makes staff stop trusting the automation. */}
                   <th className="pb-2 pr-4 font-medium">Next automatic move</th>
+                  <th className="pb-2 pr-4 font-medium">Unit value</th>
                   <th className="pb-2 pr-4 font-medium">Status</th>
                   <th className="pb-2 font-medium"></th>
                 </tr>
@@ -756,6 +774,7 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
                     <td className="py-2 pr-4">
                       <NextMove item={item} />
                     </td>
+                    <td className="py-2 pr-4 tabular-nums text-gray-600">{formatCurrency(item.unit_value)}</td>
                     <td className="py-2 pr-4">
                       <StatusBadge status={item.status} />
                     </td>
@@ -785,9 +804,159 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
         )}
       </Card>
 
+      <ProductCatalog onError={onError} />
+
       {/* FR-3.11: development-only, never in a deployed build. */}
       {import.meta.env.DEV && <OcrSimulator items={items} onError={onError} onChanged={onChanged} />}
     </div>
+  );
+}
+
+/**
+ * The catalog's per-unit value (FR-11.1) — set here once per product, then
+ * inherited by every item that scans in against it, instead of retyped at
+ * every intake.
+ */
+function ProductCatalog({ onError }) {
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [form, setForm] = useState({ upc: "", name: "", unit_value: "" });
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(
+    (q) => api.listProducts(q || undefined).then(setProducts).catch((err) => onError(err.message)),
+    [onError],
+  );
+
+  useEffect(() => {
+    load().finally(() => setLoading(false));
+  }, [load]);
+
+  async function handleCreate(e) {
+    e.preventDefault();
+    onError("");
+    setBusy(true);
+    try {
+      await api.createProduct({
+        upc: form.upc,
+        name: form.name,
+        unit_value: form.unit_value === "" ? null : Number(form.unit_value),
+      });
+      setForm({ upc: "", name: "", unit_value: "" });
+      await load(search);
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveValue(product, value) {
+    onError("");
+    try {
+      await api.updateProduct(product.id, { unit_value: value === "" ? null : Number(value) });
+      await load(search);
+    } catch (err) {
+      onError(err.message);
+    }
+  }
+
+  const input = "rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100";
+
+  return (
+    <Card
+      title="Product catalog values"
+      action={
+        <input
+          className={input}
+          placeholder="Search catalog"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            load(e.target.value);
+          }}
+          aria-label="Search catalog"
+        />
+      }
+    >
+      <p className="mb-3 text-sm text-gray-500">
+        Set a unit value on a product here and every item scanned or entered
+        against it inherits that value automatically — that's what a
+        donation gets valued at on the tax report.
+      </p>
+
+      <form onSubmit={handleCreate} className="mb-4 flex flex-wrap items-end gap-2 border-b border-gray-100 pb-4">
+        <input className={input} placeholder="UPC" required value={form.upc} onChange={(e) => setForm({ ...form, upc: e.target.value })} />
+        <input className={input} placeholder="Product name" required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <input
+          type="number"
+          min="0"
+          step="0.01"
+          className={`${input} w-28`}
+          placeholder="Unit value ($)"
+          value={form.unit_value}
+          onChange={(e) => setForm({ ...form, unit_value: e.target.value })}
+        />
+        <button disabled={busy} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60">
+          Add product
+        </button>
+      </form>
+
+      {loading ? (
+        <p className="text-sm text-gray-500">Loading…</p>
+      ) : products.length === 0 ? (
+        <Empty>No products in the catalog yet.</Empty>
+      ) : (
+        <ul className="divide-y divide-gray-100">
+          {products.map((product) => (
+            <ProductRow key={product.id} product={product} onSave={(value) => saveValue(product, value)} />
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function ProductRow({ product, onSave }) {
+  const [value, setValue] = useState(product.unit_value ?? "");
+  const [busy, setBusy] = useState(false);
+  const dirty = String(product.unit_value ?? "") !== String(value);
+
+  async function save() {
+    setBusy(true);
+    try {
+      await onSave(value);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li className="flex flex-wrap items-center justify-between gap-3 py-2 text-sm">
+      <div>
+        <div className="font-medium">{product.name}</div>
+        <div className="text-xs text-gray-500">{product.upc}{product.category ? ` · ${product.category}` : ""}</div>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-gray-400">$</span>
+        <input
+          type="number"
+          min="0"
+          step="0.01"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          className="w-24 rounded-lg border border-gray-300 px-2 py-1 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+        />
+        <button
+          onClick={save}
+          disabled={busy || !dirty}
+          className="rounded-lg border border-gray-300 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+        >
+          Save
+        </button>
+      </div>
+    </li>
   );
 }
 
@@ -1071,6 +1240,164 @@ function Shelves({ shelves, onError, onChanged }) {
             {shelves.map((shelf) => (
               <ShelfConditionCard key={shelf.id} shelf={shelf} />
             ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------------- Donation report (FR-11.1 / FR-11.3) ---------------- */
+
+/**
+ * What the business pulls at tax time: every completed donation, valued at
+ * the item's unit value when it was handed off, filterable by date range
+ * and pantry, exportable as a CSV for an accountant.
+ */
+function DonationReport({ onError }) {
+  const [pantries, setPantries] = useState([]);
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [filters, setFilters] = useState({ from: "", to: "", pantryId: "" });
+
+  const load = useCallback(
+    (f) =>
+      api
+        .listDonations({
+          from: f.from ? `${f.from}T00:00:00Z` : undefined,
+          to: f.to ? `${f.to}T23:59:59Z` : undefined,
+          pantryId: f.pantryId || undefined,
+        })
+        .then(setRecords)
+        .catch((err) => onError(err.message)),
+    [onError],
+  );
+
+  useEffect(() => {
+    Promise.all([api.listPantries().then(setPantries).catch((err) => onError(err.message)), load(filters)]).finally(
+      () => setLoading(false),
+    );
+    // Only on mount — filter changes are applied by the Apply button below,
+    // not on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function applyFilters(e) {
+    e.preventDefault();
+    onError("");
+    setLoading(true);
+    load(filters).finally(() => setLoading(false));
+  }
+
+  async function exportCsv() {
+    onError("");
+    setExporting(true);
+    try {
+      await api.downloadDonationsCsv({
+        from: filters.from ? `${filters.from}T00:00:00Z` : undefined,
+        to: filters.to ? `${filters.to}T23:59:59Z` : undefined,
+        pantryId: filters.pantryId || undefined,
+      });
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const totalValue = records.reduce((sum, r) => sum + (r.unit_value_at_handoff ? Number(r.unit_value_at_handoff) : 0), 0);
+  const input = "rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100";
+
+  return (
+    <div className="space-y-6">
+      <Card
+        title="Donation report"
+        action={
+          <button
+            onClick={exportCsv}
+            disabled={exporting || records.length === 0}
+            className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+          >
+            {exporting ? "Exporting…" : "Export CSV"}
+          </button>
+        }
+      >
+        <p className="mb-4 text-sm text-gray-600">
+          Every confirmed donation, valued at the catalog price it carried at
+          handoff (FR-11.1) — the record to hand an accountant for a tax
+          deduction.
+        </p>
+
+        <form onSubmit={applyFilters} className="mb-4 flex flex-wrap items-end gap-2">
+          <div>
+            <label className="block text-xs text-gray-500">From</label>
+            <input type="date" className={input} value={filters.from} onChange={(e) => setFilters({ ...filters, from: e.target.value })} />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500">To</label>
+            <input type="date" className={input} value={filters.to} onChange={(e) => setFilters({ ...filters, to: e.target.value })} />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500">Pantry</label>
+            <select
+              className={input}
+              value={filters.pantryId}
+              onChange={(e) => setFilters({ ...filters, pantryId: e.target.value })}
+            >
+              <option value="">All pantries</option>
+              {pantries.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.org_name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
+            Apply
+          </button>
+        </form>
+
+        {loading ? (
+          <p className="text-sm text-gray-500">Loading…</p>
+        ) : records.length === 0 ? (
+          <Empty>No donations recorded for this filter.</Empty>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="text-xs uppercase tracking-wide text-gray-500">
+                <tr>
+                  <th className="pb-2 pr-4 font-medium">Confirmed</th>
+                  <th className="pb-2 pr-4 font-medium">Item</th>
+                  <th className="pb-2 pr-4 font-medium">Pantry</th>
+                  <th className="pb-2 font-medium">Value</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {records.map((r) => (
+                  <tr key={r.id}>
+                    <td className="py-2 pr-4 text-gray-600">{formatDateTime(r.confirmed_at)}</td>
+                    <td className="py-2 pr-4">
+                      <div className="font-medium">{r.item_name}</div>
+                      <div className="text-xs text-gray-500">
+                        {r.item_category || "Uncategorized"}
+                        {r.item_sku ? ` · ${r.item_sku}` : ""}
+                      </div>
+                    </td>
+                    <td className="py-2 pr-4 text-gray-600">{r.pantry_name_at_handoff}</td>
+                    <td className="py-2 tabular-nums">{formatCurrency(r.unit_value_at_handoff)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t border-gray-200 font-medium">
+                  <td className="pt-2 pr-4" colSpan={3}>
+                    {records.length} donation{records.length === 1 ? "" : "s"}
+                  </td>
+                  <td className="pt-2 tabular-nums">{formatCurrency(totalValue)}</td>
+                </tr>
+              </tfoot>
+            </table>
           </div>
         )}
       </Card>

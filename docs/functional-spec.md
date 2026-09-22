@@ -432,18 +432,19 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 ### FR-11 Reporting and Audit Trail
 
-> **Status: ○ Proposed.** No reporting exists. This group is Could-have overall, with the exception of FR-11.1, which supports the Good Samaritan Act's good-faith documentation ([NFR-4.8](#48-legal-and-food-safety-compliance)) and is therefore Must-have.
+> **Status: ◐ Partial.** FR-11.1, FR-11.2 and the new FR-11.7 are built. The rest of this group is Could-have and remains proposed.
 
 | ID | Requirement | Priority | Status |
 |---|---|---|---|
-| **FR-11.1** | The system MUST retain an immutable record of every completed donation: item, organization, staff member confirming, timestamp, and the item's sell-by date at the time of donation. | Must | ○ |
-| **FR-11.2** | Staff MUST be able to view donation history filtered by date range and organization. | Should | ○ |
+| **FR-11.1** | The system MUST retain an immutable record of every completed donation: item, organization, staff member confirming, timestamp, and the item's sell-by date at the time of donation. | Must | ✅ *(`app/models.py:DonationRecord`, written by `crud.confirm_pickup`)* |
+| **FR-11.2** | Staff MUST be able to view donation history filtered by date range and organization. | Should | ✅ *(`GET /reports/donations`)* |
 | **FR-11.3** | An organization MUST be able to view and export its own collection history, for its own grant and impact reporting. | Should | ○ |
 | **FR-11.4** | The system SHOULD report diverted food volume over a date range, as the system's primary impact metric. | Could | ○ |
 | **FR-11.5** | The system SHOULD report OCR accuracy — auto-published count, review-queue count, and corrections made during review — to support tuning the confidence threshold. | Could | ○ |
 | **FR-11.6** | Every status change, authorization denial, and verification decision MUST be written to an append-only audit log. | Should | ○ |
+| **FR-11.7** | The system MUST value each donated item at its catalog unit price and MUST let staff export the donation history (with values) as CSV, for the business's own tax filing. | Should | ✅ *(`Product.unit_value` → `Item.unit_value` → `DonationRecord.unit_value_at_handoff`; `GET /reports/donations/export`)* |
 
-*Verification:* Complete a donation and confirm the record. Attempt to modify a historical record through the API and confirm rejection.
+*Verification:* Complete a donation and confirm the record. Attempt to modify a historical record through the API and confirm rejection. Set a product's unit value, donate a unit of it, and confirm the donation record and CSV export both carry that value.
 
 ---
 
@@ -985,7 +986,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 4. The system confirms the reservation is `pending` and that the current time is at or before `hold_expires_at` (FR-9.7).
 5. The system sets the reservation to `picked_up` and records `picked_up_at` (`app/crud.py:183-184`).
 6. The system sets the item to `picked_up` (`app/crud.py:185-187`).
-7. The system writes the immutable donation record: item, organization, confirming staff member, timestamp, and the item's sell-by date at handoff (FR-11.1).
+7. The system writes the immutable donation record: item, organization, confirming staff member, timestamp, the item's sell-by date at handoff, and its catalog unit value at handoff (FR-11.1, FR-11.7; `crud.confirm_pickup`).
 8. The dashboard confirms the item and the organization; the staff member hands over the food.
 
 **Alternate flows**
@@ -1175,6 +1176,7 @@ An item belongs to at most one shelf and may have many reservations over its lif
 | `use_by_date` | DateTime | Nullable — safety deadline, distinct from sell-by | ○ *(NFR-4.8.2)* |
 | `weight_kg` | Float | Nullable — for diversion reporting | ○ *(FR-11.4)* |
 | `reviewed_by_user_id` | UUID | FK → User, nullable | ○ *(UC-09 step 6)* |
+| `unit_value` | Numeric(10,2) | Nullable — inherited from `Product.unit_value` at intake; what a donated unit is valued at | ✅ *(FR-11.7)* |
 
 ### 6.5 Pantry (Organization)
 
@@ -1230,19 +1232,20 @@ An item belongs to at most one shelf and may have many reservations over its lif
 | `last_login_at` | DateTime | Nullable |
 | `created_at` | DateTime | Default now |
 
-### 6.8 DonationRecord — proposed
+### 6.8 DonationRecord
 
-*Required by FR-11.1 and NFR-4.8.1. Append-only; never updated or deleted.*
+*Required by FR-11.1, FR-11.7 and NFR-4.8.1. Append-only; never updated or deleted. Written by `crud.confirm_pickup`.*
 
-| Field | Type | Constraints |
-|---|---|---|
-| `id` | UUID | PK |
-| `reservation_id` | UUID | FK → Reservation, not null, unique |
-| `item_name` / `item_sku` / `item_category` | String | Snapshot at handoff — denormalized deliberately, so the record survives changes to the item |
-| `sell_by_date_at_handoff` | DateTime | Nullable |
-| `pantry_id` / `pantry_name_at_handoff` | UUID / String | Not null |
-| `confirmed_by_user_id` | UUID | FK → User, not null |
-| `confirmed_at` | DateTime | Not null, UTC |
+| Field | Type | Constraints | Status |
+|---|---|---|---|
+| `id` | UUID | PK | ✅ |
+| `reservation_id` | UUID | FK → Reservation, not null, unique | ✅ |
+| `item_name` / `item_sku` / `item_category` | String | Snapshot at handoff — denormalized deliberately, so the record survives changes to the item | ✅ |
+| `sell_by_date_at_handoff` | DateTime | Nullable | ✅ |
+| `unit_value_at_handoff` | Numeric(10,2) | Nullable — the item's `unit_value` at the moment of handoff, for tax valuation (FR-11.7) | ✅ |
+| `pantry_id` / `pantry_name_at_handoff` | UUID / String | Not null | ✅ |
+| `confirmed_by_user_id` | UUID | FK → User, not null | ✅ |
+| `confirmed_at` | DateTime | Not null, UTC | ✅ |
 
 ### 6.9 Enumerations
 
@@ -1414,13 +1417,14 @@ Base URL: `http://localhost:8000` in development. All request and response bodie
 | `POST` | `/reservations/pickup` | Bearer | **staff, manager** | `{token}` in body | `ReservationDetailOut` · 404 · 409 with reason | ◐ **← staff-only and reason-differentiated now; still `POST /reservations/pickup/{qr_code}` with the token in the URL path (FR-9.9)** |
 | `POST` | `/reservations/expire-stale` | Bearer | manager, admin | — | `[ReservationOut]` | ✅ *(FR-10.5; the scheduler also runs it every 60s)* |
 
-### 8.7 Reporting — all proposed
+### 8.7 Reporting
 
-| Method | Path | Auth | Roles | Request | Response |
-|---|---|---|---|---|---|
-| `GET` | `/reports/donations` | Bearer | staff, manager, admin; org_coordinator own only | `?from=&to=&pantry_id=` | `[DonationRecord]` |
-| `GET` | `/reports/diversion` | Bearer | staff, manager, admin | `?from=&to=` | `{item_count, weight_kg}` |
-| `GET` | `/reports/ocr-accuracy` | Bearer | manager | `?from=&to=` | `{auto_published, sent_to_review, corrected}` |
+| Method | Path | Auth | Roles | Request | Response | Status |
+|---|---|---|---|---|---|---|
+| `GET` | `/reports/donations` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `[DonationRecordOut]` | ✅ *(FR-11.2, FR-11.7 — store-side only; this is the business's own tax/audit data, not shared with org_coordinator, which is a deliberate narrowing from the original proposal below)* |
+| `GET` | `/reports/donations/export` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `text/csv` attachment, same rows as above | ✅ *(FR-11.7)* |
+| `GET` | `/reports/diversion` | Bearer | staff, manager, admin | `?from=&to=` | `{item_count, weight_kg}` | ○ |
+| `GET` | `/reports/ocr-accuracy` | Bearer | manager | `?from=&to=` | `{auto_published, sent_to_review, corrected}` | ○ |
 
 ### 8.8 Error Conventions
 
@@ -1453,7 +1457,7 @@ Errors return `{"detail": "<message>"}`, matching FastAPI's convention and the f
 | FR-8 Reservation & scheduling | UC-12, UC-13, UC-14, UC-16 | `/reservations*` | `app/crud.py:138-154` |
 | FR-9 QR & pickup | UC-14, UC-15 | `/reservations/pickup` | `app/crud.py:148, 179-190` |
 | FR-10 Expiry | UC-17 | `/reservations/expire-stale` | `app/crud.py:157-176` |
-| FR-11 Reporting | UC-15, UC-18 | `/reports/*` | ○ none |
+| FR-11 Reporting | UC-15, UC-18 | `/reports/*` | `app/routers/reports.py`, `app/models.py:DonationRecord` |
 
 **Coverage checks.** Every FR group maps to at least one use case, and every use case cites at least one FR. Every implemented endpoint maps to an FR group — no orphaned code. Four FR groups (1, 2, 11, and most of 3) have no implementation, which is the expected shape given that authentication was never built.
 
@@ -1508,7 +1512,7 @@ Ordered by severity. This doubles as a build backlog.
 
 **Phase 3 — Complete the interfaces.** Review queue (FR-3.2, FR-3.3); near-expiry view (FR-3.4); QR rendering and scanning (FR-9.3, FR-9.10); reservation listing (FR-8.10).
 
-**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); donation records (FR-11.1); rescheduling a pickup time (FR-8.7); moving the pickup token out of the URL path (FR-9.9); Alembic; tests for the confidence branch and the expiry sweep.
+**Phase 4 — Harden and measure.** Transition validation (FR-6.2); resolve the two orphan states (FR-6.4, FR-6.5); ✅ **Complete: donation records and their tax valuation** (FR-11.1, FR-11.2, FR-11.7); rescheduling a pickup time (FR-8.7); moving the pickup token out of the URL path (FR-9.9); Alembic; tests for the confidence branch and the expiry sweep.
 
 ---
 
@@ -1526,8 +1530,8 @@ Ordered by severity. This doubles as a build backlog.
 | FR-8 Reservation | 12 | 3 | 3 | 6 |
 | FR-9 QR & pickup | 10 | 3 | 2 | 5 |
 | FR-10 Expiry | 7 | 2 | 0 | 5 |
-| FR-11 Reporting | 6 | 0 | 0 | 6 |
-| **Total** | **98** | **21** | **14** | **63** |
+| FR-11 Reporting | 7 | 3 | 0 | 4 |
+| **Total** | **99** | **24** | **14** | **61** |
 
 Roughly a fifth of the specified functionality is implemented, and it is concentrated in the parts hardest to get right — the OCR confidence branch, the hold-window arithmetic, and the expiry sweep are all correct. What is missing is the layer around them: who is allowed to do any of it.
 

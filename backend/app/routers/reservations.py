@@ -140,7 +140,7 @@ def confirm_pickup(
     the problem is the wrong code, a second scan, or an organization that
     arrived too late.
     """
-    reservation, outcome = crud.confirm_pickup(db, qr_code)
+    reservation, outcome = crud.confirm_pickup(db, qr_code, confirmed_by_user_id=user.id)
 
     if outcome == "not_found":
         raise HTTPException(status_code=404, detail="That code doesn't match any reservation.")

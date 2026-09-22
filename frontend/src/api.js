@@ -129,6 +129,7 @@ export const api = {
   listProducts: (search) =>
     request(search ? `/catalog/products?search=${encodeURIComponent(search)}` : "/catalog/products"),
   createProduct: (data) => post("/catalog/products", data),
+  updateProduct: (id, data) => patch(`/catalog/products/${id}`, data),
   listExpirationRules: () => request("/catalog/expiration-rules"),
   updateExpirationRule: (id, data, recompute = false) =>
     patch(`/catalog/expiration-rules/${id}?recompute=${recompute}`, data),
@@ -144,6 +145,7 @@ export const api = {
 
   // ---- pantries ----
   registerPantry: (data) => post("/pantries", data),
+  listPantries: () => request("/pantries"),
 
   // ---- reservations ----
   // `scheduledPickupLocal` is the raw value out of an
@@ -158,7 +160,45 @@ export const api = {
   allReservations: () => request("/reservations"),
   cancelReservation: (id) => post(`/reservations/${id}/cancel`),
   confirmPickup: (qrCode) => post(`/reservations/pickup/${encodeURIComponent(qrCode)}`),
+
+  // ---- donation reports (FR-11.1 / FR-11.3), staff-only ----
+  listDonations: (filters) => request(`/reports/donations${donationQuery(filters)}`),
+  // A plain <a href> can't carry the bearer token, so this fetches the CSV
+  // as a blob and hands the browser a throwaway object URL to save it from.
+  downloadDonationsCsv: async (filters) => {
+    const token = getToken();
+    const res = await fetch(`${BASE_URL}/reports/donations/export${donationQuery(filters)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (res.status === 401) {
+      clearToken();
+      onUnauthorized();
+      throw new Error("Your session ended. Sign in again.");
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(detailMessage(body, `Export failed: ${res.status}`));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `donations_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  },
 };
+
+function donationQuery({ from, to, pantryId } = {}) {
+  const params = new URLSearchParams();
+  if (from) params.set("date_from", from);
+  if (to) params.set("date_to", to);
+  if (pantryId) params.set("pantry_id", pantryId);
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
 
 /**
  * The API serializes datetime.utcnow() with no timezone suffix, e.g.
@@ -200,6 +240,14 @@ export function toUtcIso(localValue) {
  * shifts every bound by the viewer's offset — the same class of bug
  * parseUtc exists to prevent, just pointing the other way.
  */
+/** `null`/`undefined` renders as "—" — most items have no catalog value set,
+ * and that's an ordinary, expected state, not a zero dollar amount. */
+export function formatCurrency(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const n = Number(value);
+  return Number.isNaN(n) ? "—" : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+}
+
 export function toLocalInputValue(date) {
   if (!date || Number.isNaN(date.getTime())) return "";
   const pad = (n) => String(n).padStart(2, "0");

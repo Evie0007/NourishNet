@@ -22,7 +22,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, String, Float, Integer, DateTime, ForeignKey, Enum as SAEnum,
-    Boolean, Text, JSON
+    Boolean, Text, JSON, Numeric
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -169,6 +169,11 @@ class Product(Base):
     # automatically, no matter how clean the read was.
     donation_restricted = Column(Boolean, default=False, nullable=False)
 
+    # Per-unit value used to value a donated unit of this product for tax
+    # records (FR-11.1). Nullable: a product with no value set simply
+    # produces items with no value, rather than blocking intake.
+    unit_value = Column(Numeric(10, 2), nullable=True)
+
     source = Column(String, nullable=True)   # "catalog" | "external" | "staff"
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -248,6 +253,11 @@ class Item(Base):
     # row, and so staff can see exactly when each transition will fire.
     donate_after = Column(DateTime, nullable=True, index=True)
     discard_after = Column(DateTime, nullable=True, index=True)
+
+    # Inherited from Product.unit_value at intake (same "catalog fills gaps"
+    # rule as category/sku above) — the value this unit is worth when it's
+    # eventually donated (FR-11.1).
+    unit_value = Column(Numeric(10, 2), nullable=True)
 
     shelf_id = Column(UUID(as_uuid=False), ForeignKey("shelves.id"), nullable=True)
     shelf = relationship("Shelf", back_populates="items")
@@ -375,3 +385,42 @@ class Reservation(Base):
 
     item = relationship("Item", back_populates="reservations")
     pantry = relationship("Pantry", back_populates="reservations")
+
+
+class DonationRecord(Base):
+    """
+    The immutable audit trail FR-11.1 asks for: one row per completed
+    donation, written the instant a pickup is confirmed
+    (crud.confirm_pickup) and never updated or deleted afterward.
+
+    Fields are snapshotted at handoff time rather than joined live, on
+    purpose — an Item's name, category or value can be edited later (a
+    catalog correction, a price change), and a Pantry's name can change,
+    but what this record certifies is what was true the moment the
+    donation happened. That's also what Good Samaritan Act documentation
+    (NFR-4.8.1) and a tax record both need: a fact that doesn't move.
+    """
+    __tablename__ = "donation_records"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+
+    reservation_id = Column(
+        UUID(as_uuid=False), ForeignKey("reservations.id"), nullable=False, unique=True
+    )
+    reservation = relationship("Reservation")
+
+    item_name = Column(String, nullable=False)
+    item_sku = Column(String, nullable=True)
+    item_category = Column(String, nullable=True)
+    sell_by_date_at_handoff = Column(DateTime, nullable=True)
+
+    # The item's unit_value at the moment of handoff — what this donation
+    # is worth for tax purposes. Nullable: items with no catalog value
+    # produce a record with no value, rather than blocking the donation.
+    unit_value_at_handoff = Column(Numeric(10, 2), nullable=True)
+
+    pantry_id = Column(UUID(as_uuid=False), ForeignKey("pantries.id"), nullable=False, index=True)
+    pantry_name_at_handoff = Column(String, nullable=False)
+
+    confirmed_by_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    confirmed_at = Column(DateTime, nullable=False, index=True)

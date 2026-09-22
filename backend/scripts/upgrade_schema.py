@@ -40,9 +40,13 @@ NEW_COLUMNS = {
         "date_source":     {"postgresql": "datesource",   "sqlite": "VARCHAR(10)"},
         "donate_after":    {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
         "discard_after":   {"postgresql": "TIMESTAMP",   "sqlite": "DATETIME"},
+        "unit_value":      {"postgresql": "NUMERIC(10,2)", "sqlite": "NUMERIC(10,2)"},
     },
     "reservations": {
         "scheduled_pickup_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
+    },
+    "products": {
+        "unit_value": {"postgresql": "NUMERIC(10,2)", "sqlite": "NUMERIC(10,2)"},
     },
 }
 
