@@ -33,8 +33,18 @@ DEMO_PRODUCTS = [
     ("038000356216", "Greek Yogurt 6-pack",    "Dairy",    14,  False),
     ("041196910759", "Sourdough Loaf",         "Bakery",    3,  False),
     ("028400157155", "Blueberry Muffins 4ct",  "Bakery",    4,  False),
+    ("000284001199", "Bagels 6ct",             "Bakery",    5,  False),
+    ("041500291208", "Whole Wheat Bread Loaf", "Bakery",    5,  False),
     ("681131022217", "Baby Spinach 5oz",       "Produce",   5,  False),
+    ("000333836208", "Carrots 2lb Bag",        "Produce",  21,  False),
+    ("000333837205", "Apples 3lb Bag",         "Produce",  21,  False),
+    ("000420000451", "Bananas Bunch",          "Produce",   6,  False),
     ("073731000106", "Cheddar Block 8oz",      "Dairy",    60,  False),
+    ("024000098621", "Canned Black Beans 15oz","Pantry",  730,  False),
+    ("024000016304", "Canned Diced Tomatoes 14.5oz", "Pantry", 730, False),
+    ("000284005098", "Pretzels 10oz",          "Pantry",  180,  False),
+    ("002143000633", "Ground Beef 1lb 80/20",  "Meat",      4,  False),
+    ("002144120422", "Chicken Breast 1lb",     "Meat",      3,  False),
     # Never auto-published, whatever the read looked like (NFR-4.8.6). Worth
     # having in the demo: it is the case where the automation declines to act.
     ("300871239609", "Infant Formula 12.4oz",  "Infant",  365,  True),
@@ -161,6 +171,7 @@ def main():
                 models.Shelf(name="Shelf A — Dairy", location="Aisle 3, north end", camera_id="cam-a1"),
                 models.Shelf(name="Shelf B — Bakery", location="Front of store", camera_id="cam-b1"),
                 models.Shelf(name="Shelf C — Produce", location="Aisle 1", camera_id="cam-c1"),
+                models.Shelf(name="Shelf D — Meat & Pantry", location="Aisle 5, back wall", camera_id="cam-d1"),
             ]
             for shelf in shelves:
                 db.add(shelf)
@@ -171,6 +182,9 @@ def main():
             shelves[1].current_temperature_c = 20.8
             shelves[1].current_humidity_pct = 44.0
             shelves[1].last_reading_at = now - timedelta(minutes=4)
+            shelves[3].current_temperature_c = 1.7
+            shelves[3].current_humidity_pct = 58.0
+            shelves[3].last_reading_at = now - timedelta(minutes=1)
 
             items = [
                 # name,                  sku,         category, shelf, status,                    +hours, upc
@@ -198,7 +212,22 @@ def main():
                 # rather than a correctly-working safety rule.
                 ("Butter 1lb",           "DAIRY-031", "Dairy",  0, models.ItemStatus.RESERVED,      48, None),
                 ("Heavy Cream 1qt",      "DAIRY-052", "Dairy",  0, models.ItemStatus.RESERVED,      60, None),
-                ("Bagels 6ct",           "BAKE-011",  "Bakery", 1, models.ItemStatus.PICKED_UP,     36, None),
+                ("Bagels 6ct",           "BAKE-011",  "Bakery", 1, models.ItemStatus.PICKED_UP,     36, "000284001199"),
+                # More of the everyday grocery mix, so the demo isn't just
+                # dairy and bakery — produce, pantry staples, and meat each
+                # get a representative or two.
+                ("Whole Wheat Bread Loaf","BAKE-034",  "Bakery", 1, models.ItemStatus.IN_STOCK,      60, "041500291208"),
+                ("Carrots 2lb Bag",      "PROD-201",  "Produce",2, models.ItemStatus.IN_STOCK,     300, "000333836208"),
+                ("Apples 3lb Bag",       "PROD-207",  "Produce",2, models.ItemStatus.IN_STOCK,     280, "000333837205"),
+                ("Bananas Bunch",        "PROD-205",  "Produce",2, models.ItemStatus.AVAILABLE,       6, "000420000451"),
+                ("Canned Black Beans 15oz","PANT-010","Pantry", 3, models.ItemStatus.IN_STOCK,   17000, "024000098621"),
+                ("Canned Diced Tomatoes 14.5oz","PANT-011","Pantry",3, models.ItemStatus.AVAILABLE,  2, "024000016304"),
+                ("Pretzels 10oz",        "PANT-022",  "Pantry", 3, models.ItemStatus.IN_STOCK,    4200, "000284005098"),
+                # Meat's auto_publish is False (staff always inspect before
+                # any meat is offered), so these are the demo's proof that
+                # the automation correctly declines to act on its own.
+                ("Ground Beef 1lb 80/20","MEAT-004",  "Meat",   3, models.ItemStatus.NEEDS_REVIEW,   18, None),
+                ("Chicken Breast 1lb",   "MEAT-009",  "Meat",   3, models.ItemStatus.IN_STOCK,       14, "002144120422"),
             ]
             rules = expiration.load_rules(db)
             created_items = {}
