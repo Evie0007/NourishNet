@@ -170,6 +170,7 @@ function RegisterOrg({ onDone }) {
     contact_email: "",
     phone: "",
     address: "",
+    password: "",
   });
   const [error, setError] = useState("");
   const [done, setDone] = useState(false);
@@ -230,6 +231,13 @@ function RegisterOrg({ onDone }) {
       {field("org_name", "Organization name", { required: true })}
       {field("ein", "EIN", { required: true, placeholder: "94-2960297" })}
       {field("contact_email", "Contact email", { required: true, type: "email" })}
+      {field("password", "Password", {
+        required: true,
+        type: "password",
+        minLength: 10,
+        maxLength: 72,
+        autoComplete: "new-password",
+      })}
       {field("phone", "Phone")}
       {field("address", "Address")}
       <button

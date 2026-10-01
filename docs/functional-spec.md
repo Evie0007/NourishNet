@@ -346,12 +346,12 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 | ID | Requirement | Priority | Status |
 |---|---|---|---|
-| **FR-7.1** | An organization MUST be able to self-register with organization name, EIN, address, phone, and contact email. | Must | ◐ *(address and phone accepted by the API but absent from the form: `PantryPage.jsx:99-129`)* |
+| **FR-7.1** | An organization MUST be able to self-register with organization name, EIN, address, phone, and contact email. | Must | ✅ |
 | **FR-7.2** | Contact email MUST be unique across organizations and MUST be validated as well-formed. | Must | ✅ *(`app/models.py:97`; `EmailStr` at `app/schemas.py:89`)* |
 | **FR-7.3** | A newly registered organization MUST begin in an unverified state. | Must | ✅ *(`app/models.py:98`)* |
 | **FR-7.4** | An unverified organization MUST NOT be able to reserve items. Reservation attempts MUST return 403 with an explanation of the pending verification. | Must | ○ **← security gap** |
 | **FR-7.5** | A Platform Admin MUST be able to review a pending registration and mark it verified or rejected, with the decision, the deciding admin, and the timestamp recorded. | Must | ○ |
-| **FR-7.6** | EIN MUST be validated for format (nine digits, `NN-NNNNNNN`) at registration, and MUST be unique across organizations. | Must | ○ *(currently a free-text string: `app/models.py:94`)* |
+| **FR-7.6** | EIN MUST be validated for format (nine digits, `NN-NNNNNNN`) at registration, and MUST be unique across organizations. | Must | ✅ *(app/schemas.py — format and uniqueness enforced at the application layer; no DB unique constraint on ein, to ship without a migration against the deployed database)* |
 | **FR-7.7** | The system MUST notify the organization's contact email when verification is granted or refused. | Should | ○ |
 | **FR-7.8** | An admin MUST be able to revoke verification, which MUST prevent new reservations while leaving existing ones intact. | Should | ○ |
 | **FR-7.9** | The public organization listing MUST NOT expose EIN, phone, or contact email to non-admin users. | Must | ○ *(currently all fields are returned to anyone: `app/schemas.py:92-101`)* |
@@ -1186,7 +1186,7 @@ An item belongs to at most one shelf and may have many reservations over its lif
 |---|---|---|---|
 | `id` | UUID (string) | PK, generated | ✅ |
 | `org_name` | String | Not null | ✅ |
-| `ein` | String | Not null | ✅ *(format unvalidated, not unique — FR-7.6)* |
+| `ein` | String | Not null | ✅ *(format and uniqueness validated at the application layer — FR-7.6)* |
 | `address` | String | Nullable | ✅ |
 | `phone` | String | Nullable | ✅ |
 | `contact_email` | String | Not null, unique | ✅ |
@@ -1399,7 +1399,7 @@ Base URL: `http://localhost:8000` in development. All request and response bodie
 
 | Method | Path | Auth | Roles | Request | Response | Status |
 |---|---|---|---|---|---|---|
-| `POST` | `/pantries` | None | — (self-registration) | `PantryCreate` | `PantryOut` · 409 duplicate | ◐ *(FR-7.6)* |
+| `POST` | `/pantries` | None | — (self-registration) | `PantryCreate` | `PantryOut` · 409 duplicate | ✅ |
 | `GET` | `/pantries` | Bearer ○ | staff, manager, admin | `?verified_only=` | `[PantryOut]` | ◐ *(FR-7.9 — currently leaks EIN, phone, email to anyone)* |
 | `GET` | `/pantries/{id}` | Bearer | admin; own org | — | `PantryOut` · 404 | ○ |
 | `PATCH` | `/pantries/{id}/verification` | Bearer | admin | `{verified, notes}` | `PantryOut` | ○ **← FR-7.5, the missing gate** |
