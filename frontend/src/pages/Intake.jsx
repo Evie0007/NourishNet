@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, parseUtc } from "../api";
 import BarcodeScanner from "../components/BarcodeScanner";
+import RipenessCheck from "../components/RipenessCheck";
 import { Card, Empty } from "../components/Shell";
 
 /**
@@ -82,6 +83,8 @@ export default function Intake({ shelves, onError, onChanged }) {
       ) : (
         <ScanPanel shelves={shelves} onError={onError} onScanned={setScan} />
       )}
+
+      <RipenessCheck />
 
       <Card title={`Waiting on confirmation (${pending.length})`}>
         {pending.length === 0 ? (
