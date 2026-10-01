@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import auth, crud, models, schemas
@@ -11,12 +11,22 @@ router = APIRouter(prefix="/pantries", tags=["pantries"])
 def register_pantry(pantry: schemas.PantryCreate, db: Session = Depends(get_db)):
     """
     Deliberately unauthenticated — this is the pre-auth self-registration
-    flow of UC-03. Per Section 4.3 of the proposal, `verified` stays False
-    until org name / EIN / address / phone / email are confirmed, and
-    FR-7.4 blocks reservations until then (enforced in the reservations
-    router). Still missing: the admin queue that flips `verified` to True.
+    flow of UC-03. `verified` stays False until an admin reviews the
+    organization (FR-7.5, still unbuilt) and FR-7.4 blocks reservations
+    until then (enforced in the reservations router).
+
+    Alt-flow 3c (malformed EIN) is rejected by PantryCreate's field
+    validator before this body ever runs; only 3a/3b are handled here, in
+    the order the spec lists them.
     """
-    return crud.create_pantry(db, pantry)
+    if crud.get_user_by_email(db, pantry.contact_email) is not None:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    if crud.get_pantry_by_ein(db, pantry.ein) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="An organization with this EIN is already registered. Contact your administrator for access.",
+        )
+    return crud.register_organization(db, pantry)
 
 
 @router.get("", response_model=list[schemas.PantryOut])

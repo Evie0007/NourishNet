@@ -4,6 +4,7 @@ the SQLAlchemy models in models.py. Keeping them separate means we can
 change the DB schema without automatically changing what the app/OCR
 pipeline sends and receives, and vice versa.
 """
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -330,12 +331,28 @@ class IntakeScanOut(BaseModel):
 
 # ---------- Pantry ----------
 
+EIN_RE = re.compile(r"^\d{2}-\d{7}$")
+
+
 class PantryCreate(BaseModel):
+    """UC-03 self-registration payload. `password` provisions the bound
+    coordinator account (FR-7.1) — it never appears in PantryOut."""
     org_name: str
     ein: str
     address: Optional[str] = None
     phone: Optional[str] = None
     contact_email: EmailStr
+    password: str = Field(min_length=10, max_length=72)
+
+    @field_validator("ein")
+    @classmethod
+    def _valid_ein_format(cls, value: str) -> str:
+        """FR-7.6: nine digits as NN-NNNNNNN. A raised ValueError becomes a
+        422 automatically — this covers alt-flow 3c with no handler code."""
+        value = value.strip()
+        if not EIN_RE.match(value):
+            raise ValueError("EIN must be in the format NN-NNNNNNN (e.g. 94-2960297).")
+        return value
 
 
 class PantryOut(BaseModel):

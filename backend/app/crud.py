@@ -11,7 +11,7 @@ from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from . import expiration, models, schemas, upc as upc_lib
+from . import auth, expiration, models, schemas, upc as upc_lib
 
 # Section 13.1 of the proposal: 95% is the starting confidence target.
 # Kept as a module-level constant so it's easy to tune during testing week
@@ -487,9 +487,38 @@ def reject_intake_scan(
 
 # ---------- Pantries ----------
 
-def create_pantry(db: Session, pantry: schemas.PantryCreate) -> models.Pantry:
-    db_pantry = models.Pantry(**pantry.model_dump())
+def get_pantry_by_ein(db: Session, ein: str) -> Optional[models.Pantry]:
+    return db.query(models.Pantry).filter(models.Pantry.ein == ein.strip()).first()
+
+
+def register_organization(db: Session, payload: "schemas.PantryCreate") -> models.Pantry:
+    """UC-03 step 4: creates the Pantry and its bound coordinator User as one
+    transaction. The pantry is flushed (not committed) first only to obtain
+    its generated id for the User's pantry_id FK; one commit at the end means
+    a failure partway through (e.g. a same-email race past the router's
+    pre-checks) rolls the pantry back too, instead of leaving an orphaned
+    unverified organization with no coordinator ever able to log into it.
+    """
+    db_pantry = models.Pantry(
+        org_name=payload.org_name,
+        ein=payload.ein,
+        address=payload.address,
+        phone=payload.phone,
+        contact_email=payload.contact_email,
+    )
     db.add(db_pantry)
+    db.flush()
+
+    coordinator = models.User(
+        email=payload.contact_email.strip(),
+        password_hash=auth.hash_password(payload.password),
+        full_name=None,
+        role=models.UserRole.ORG_COORDINATOR,
+        pantry_id=db_pantry.id,
+        is_active=True,
+    )
+    db.add(coordinator)
+
     db.commit()
     db.refresh(db_pantry)
     return db_pantry
