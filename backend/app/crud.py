@@ -6,6 +6,7 @@ routers) so they can be unit-tested directly without spinning up the API.
 """
 import secrets
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import func
@@ -769,3 +770,32 @@ def list_donation_records(
     if pantry_id:
         q = q.filter(models.DonationRecord.pantry_id == pantry_id)
     return q.order_by(models.DonationRecord.confirmed_at.desc()).all()
+
+
+def summarize_donations_by_year(
+    db: Session,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    pantry_id: Optional[str] = None,
+) -> list[dict]:
+    """Tax-year totals (FR-11.8): one row per calendar year of confirmed_at,
+    the number an accountant asks for. Takes the same filters as
+    list_donation_records so a filtered report's totals always match its
+    detail rows. Grouped in Python, not SQL GROUP BY/EXTRACT, because
+    donation volume per store is small and the records are immutable, so
+    recomputing per request is cheap and this stays identical on SQLite
+    (tests) and Postgres (prod) without a dialect-specific date function.
+    """
+    records = list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    by_year: dict[int, dict] = {}
+    for r in records:
+        bucket = by_year.setdefault(
+            r.confirmed_at.year,
+            {"tax_year": r.confirmed_at.year, "total_value": Decimal("0"), "item_count": 0, "unvalued_item_count": 0},
+        )
+        bucket["item_count"] += 1
+        if r.unit_value_at_handoff is not None:
+            bucket["total_value"] += r.unit_value_at_handoff
+        else:
+            bucket["unvalued_item_count"] += 1
+    return sorted(by_year.values(), key=lambda b: b["tax_year"], reverse=True)

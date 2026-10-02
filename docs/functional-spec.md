@@ -432,7 +432,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 ### FR-11 Reporting and Audit Trail
 
-> **Status: ◐ Partial.** FR-11.1, FR-11.2 and the new FR-11.7 are built. The rest of this group is Could-have and remains proposed.
+> **Status: ◐ Partial.** FR-11.1, FR-11.2, FR-11.7 and FR-11.8 are built. The rest of this group is Could-have and remains proposed.
 
 | ID | Requirement | Priority | Status |
 |---|---|---|---|
@@ -443,6 +443,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 | **FR-11.5** | The system SHOULD report OCR accuracy — auto-published count, review-queue count, and corrections made during review — to support tuning the confidence threshold. | Could | ○ |
 | **FR-11.6** | Every status change, authorization denial, and verification decision MUST be written to an append-only audit log. | Should | ○ |
 | **FR-11.7** | The system MUST value each donated item at its catalog unit price and MUST let staff export the donation history (with values) as CSV, for the business's own tax filing. | Should | ✅ *(`Product.unit_value` → `Item.unit_value` → `DonationRecord.unit_value_at_handoff`; `GET /reports/donations/export`)* |
+| **FR-11.8** | The system MUST let staff view and export total donation value grouped by calendar tax year, for annual tax filing. | Should | ✅ *(`crud.summarize_donations_by_year`; `GET /reports/donations/summary`; year subtotals on `GET /reports/donations/export`)* |
 
 *Verification:* Complete a donation and confirm the record. Attempt to modify a historical record through the API and confirm rejection. Set a product's unit value, donate a unit of it, and confirm the donation record and CSV export both carry that value.
 
@@ -1422,7 +1423,8 @@ Base URL: `http://localhost:8000` in development. All request and response bodie
 | Method | Path | Auth | Roles | Request | Response | Status |
 |---|---|---|---|---|---|---|
 | `GET` | `/reports/donations` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `[DonationRecordOut]` | ✅ *(FR-11.2, FR-11.7 — store-side only; this is the business's own tax/audit data, not shared with org_coordinator, which is a deliberate narrowing from the original proposal below)* |
-| `GET` | `/reports/donations/export` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `text/csv` attachment, same rows as above | ✅ *(FR-11.7)* |
+| `GET` | `/reports/donations/summary` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `[DonationYearSummaryOut]` — one row per calendar tax year | ✅ *(FR-11.8 — same store-side-only scope as `/reports/donations`)* |
+| `GET` | `/reports/donations/export` | Bearer | staff, manager, admin | `?date_from=&date_to=&pantry_id=` | `text/csv` attachment, same rows as above plus per-year subtotals | ✅ *(FR-11.7, FR-11.8)* |
 | `GET` | `/reports/diversion` | Bearer | staff, manager, admin | `?from=&to=` | `{item_count, weight_kg}` | ○ |
 | `GET` | `/reports/ocr-accuracy` | Bearer | manager | `?from=&to=` | `{auto_published, sent_to_review, corrected}` | ○ |
 
