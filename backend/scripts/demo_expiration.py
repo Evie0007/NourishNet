@@ -72,6 +72,7 @@ def stock_one(db, user, name, category, label_type):
         db,
         schemas.IntakeScanCreate(name_override=name, category_override=category, quantity=1),
         user.id,
+        store_id=user.store_id,
     )
     _scan, [item] = crud.confirm_intake_scan(
         db,
@@ -100,6 +101,14 @@ def main():
                 is_active=False,   # cannot be signed into
             )
             db.add(user)
+        # Intake is scoped to a store, so the demo operator needs one. A
+        # throwaway store of its own, so it never touches a real one.
+        store = db.query(models.Store).filter(models.Store.name == "Expiration demo store").first()
+        if store is None:
+            store = models.Store(name="Expiration demo store", active=True)
+            db.add(store)
+            db.flush()
+        user.store_id = store.id
         pantry = (
             db.query(models.Pantry)
             .filter(models.Pantry.contact_email == "demo-pantry@example.com")

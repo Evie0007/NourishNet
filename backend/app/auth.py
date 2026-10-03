@@ -150,6 +150,69 @@ def require_staff(user: models.User = Depends(require_role(*STORE_ROLES))) -> mo
     return user
 
 
+def visible_store_ids(db: Session, user: models.User) -> Optional[list[str]]:
+    """
+    Which stores a store-side user may see. `None` means unrestricted, which
+    only the platform admin gets. Everything else gets an explicit list, and
+    an empty list when nothing is linked to the account.
+
+    An account with no store and no brand sees nothing. Failing closed means
+    a mis-linked account shows an empty dashboard rather than another
+    store's stock (NFR-4.6.1).
+
+    Brand staff see every store in their brand, and nothing from any other
+    brand. Inactive stores are dropped here, so a deactivated store's staff
+    get an empty view as well.
+    """
+    if user.role == models.UserRole.ADMIN:
+        return None
+    if user.role not in STORE_ROLES:
+        return []
+
+    if user.store_id:
+        store = db.get(models.Store, user.store_id)
+        return [store.id] if store and store.active else []
+
+    if user.brand_id:
+        rows = (
+            db.query(models.Store.id)
+            .filter(models.Store.brand_id == user.brand_id)
+            .filter(models.Store.active == True)  # noqa: E712
+            .all()
+        )
+        return [row.id for row in rows]
+
+    return []
+
+
+def resolve_write_store(db: Session, user: models.User, requested: Optional[str]) -> str:
+    """
+    The store a new record belongs to. A store account always writes to its
+    own store, so a body that names another store is refused rather than
+    quietly ignored. A brand account has to say which location it means,
+    since a chain's staff can work at any of its stores.
+    """
+    store_ids = visible_store_ids(db, user) or []
+    if not store_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is not linked to an active store.",
+        )
+    if requested:
+        if requested in store_ids:
+            return requested
+        raise HTTPException(
+            status_code=403,
+            detail="That store is not one of yours.",
+        )
+    if len(store_ids) == 1:
+        return store_ids[0]
+    raise HTTPException(
+        status_code=422,
+        detail="Choose which store this is for.",
+    )
+
+
 def require_organizer(
     user: models.User = Depends(require_role(models.UserRole.ORG_COORDINATOR)),
 ) -> models.User:

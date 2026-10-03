@@ -56,6 +56,12 @@ ORG_EMAIL = os.getenv("DEMO_ORG_EMAIL", "nourishnet26+organizer@gmail.com")
 DEMO_ORG_NAME = "Second Harvest Demo Pantry"
 DEMO_ORG_EIN = "94-2960297"
 
+# The store the demo shelves and the demo staff account belong to. Every
+# store-side view is scoped to a store, so without this the staff login would
+# see an empty dashboard (NFR-4.6.1).
+DEMO_STORE_NAME = "Demo Market"
+DEMO_STORE_ADDRESS = "750 Curtner Ave, San Jose, CA 95125"
+
 
 def require_password(var: str) -> str:
     value = os.getenv(var)
@@ -70,7 +76,7 @@ def require_password(var: str) -> str:
     return value
 
 
-def upsert_user(db, *, email, password, role, full_name, pantry_id=None):
+def upsert_user(db, *, email, password, role, full_name, pantry_id=None, store_id=None):
     user = db.query(models.User).filter(models.User.email == email).first()
     if user is None:
         user = models.User(email=email)
@@ -83,6 +89,7 @@ def upsert_user(db, *, email, password, role, full_name, pantry_id=None):
     user.role = role
     user.full_name = full_name
     user.pantry_id = pantry_id
+    user.store_id = store_id
     user.is_active = True
     print(f"  {action}: {email}  ({role.value})")
     return user
@@ -141,6 +148,16 @@ def main():
         pantry.verified = True
         db.flush()
 
+        print("Store:")
+        store = db.query(models.Store).filter(models.Store.name == DEMO_STORE_NAME).first()
+        if store is None:
+            store = models.Store(name=DEMO_STORE_NAME, address=DEMO_STORE_ADDRESS, active=True)
+            db.add(store)
+            db.flush()
+            print(f"  created: {DEMO_STORE_NAME}")
+        else:
+            print(f"  updated: {DEMO_STORE_NAME}")
+
         print("Users:")
         upsert_user(
             db,
@@ -148,6 +165,7 @@ def main():
             password=staff_password,
             role=models.UserRole.MANAGER,
             full_name="Demo Store Manager",
+            store_id=store.id,
         )
         upsert_user(
             db,
@@ -174,6 +192,7 @@ def main():
                 models.Shelf(name="Shelf D — Meat & Pantry", location="Aisle 5, back wall", camera_id="cam-d1"),
             ]
             for shelf in shelves:
+                shelf.store_id = store.id
                 db.add(shelf)
             db.flush()
             shelves[0].current_temperature_c = 3.4
@@ -246,6 +265,7 @@ def main():
                     date_label_type=models.DateLabelType.SELL_BY,
                     date_source=models.DateSource.MANUAL,
                     arrival_date=now - timedelta(days=2),
+                    store_id=store.id,
                 )
                 if item_status == models.ItemStatus.NEEDS_REVIEW:
                     # The two ways an item lands in review: confidence below
@@ -309,6 +329,7 @@ def main():
             milk = upc_lib.find_product(db, upc_lib.normalize("036000291452"))
             db.add(
                 models.IntakeScan(
+                    store_id=store.id,
                     upc=milk.upc,
                     product_id=milk.id,
                     shelf_id=shelves[0].id,

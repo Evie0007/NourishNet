@@ -3,11 +3,12 @@ from datetime import datetime, timedelta
 
 from app import models
 
-from .conftest import iso_in
+from .conftest import default_store, iso_in
 
 
 def _item(db, name):
     item = models.Item(
+        store_id=default_store(db).id,
         name=name,
         category="Dairy",
         status=models.ItemStatus.AVAILABLE,

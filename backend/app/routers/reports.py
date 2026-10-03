@@ -28,7 +28,10 @@ def list_donations(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    return crud.list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    return crud.list_donation_records(
+        db, date_from=date_from, date_to=date_to, pantry_id=pantry_id,
+        store_ids=auth.visible_store_ids(db, user),
+    )
 
 
 @router.get("/donations/summary", response_model=list[schemas.DonationYearSummaryOut])
@@ -39,7 +42,10 @@ def summarize_donations(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    return crud.summarize_donations_by_year(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    return crud.summarize_donations_by_year(
+        db, date_from=date_from, date_to=date_to, pantry_id=pantry_id,
+        store_ids=auth.visible_store_ids(db, user),
+    )
 
 
 @router.get("/donations/export")
@@ -54,7 +60,10 @@ def export_donations(
     accountant without also giving them API access. Trailing subtotal rows
     (FR-11.8) are grouped by calendar tax year, honoring the same filters
     as the detail rows above them so the two always agree."""
-    records = crud.list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    store_ids = auth.visible_store_ids(db, user)
+    records = crud.list_donation_records(
+        db, date_from=date_from, date_to=date_to, pantry_id=pantry_id, store_ids=store_ids
+    )
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -75,7 +84,9 @@ def export_donations(
             r.reservation_id,
         ])
 
-    year_totals = crud.summarize_donations_by_year(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    year_totals = crud.summarize_donations_by_year(
+        db, date_from=date_from, date_to=date_to, pantry_id=pantry_id, store_ids=store_ids
+    )
     writer.writerow([])
     writer.writerow(["Tax year", "Total value", "Item count"])
     grand_total = Decimal("0")

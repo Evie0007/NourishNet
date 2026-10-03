@@ -7,7 +7,7 @@ pipeline sends and receives, and vice versa.
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import (
     AwareDatetime, BaseModel, EmailStr, ConfigDict, Field, field_validator, model_validator
 )
@@ -51,6 +51,9 @@ class ShelfCreate(BaseModel):
     name: str
     location: Optional[str] = None
     camera_id: Optional[str] = None
+    # Only a brand account needs to name its store. A store account's own
+    # store is used whatever is sent here (auth.resolve_write_store).
+    store_id: Optional[str] = None
 
 
 class ShelfReadingUpdate(BaseModel):
@@ -61,6 +64,7 @@ class ShelfReadingUpdate(BaseModel):
 class ShelfOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    store_id: Optional[str] = None
     name: str
     location: Optional[str]
     camera_id: Optional[str]
@@ -73,6 +77,7 @@ class ShelfOut(BaseModel):
 
 class ItemCreate(BaseModel):
     name: str
+    store_id: Optional[str] = None
     sku: Optional[str] = None
     upc: Optional[str] = None
     batch_id: Optional[str] = None
@@ -103,6 +108,7 @@ class ItemOCRResult(BaseModel):
 class ItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    store_id: Optional[str] = None
     name: str
     sku: Optional[str]
     upc: Optional[str] = None
@@ -238,6 +244,8 @@ class IntakeScanCreate(BaseModel):
     legible date, or a date on a package whose barcode won't read.
     """
     upc: Optional[str] = None
+    # The location the scan is made at. Same rule as ShelfCreate.store_id.
+    store_id: Optional[str] = None
     shelf_id: Optional[str] = None
     quantity: int = Field(default=1, ge=1, le=999)
     batch_id: Optional[str] = None
@@ -332,6 +340,50 @@ class IntakeScanOut(BaseModel):
 # ---------- Pantry ----------
 
 EIN_RE = re.compile(r"^\d{2}-\d{7}$")
+
+
+class BrandCreate(BaseModel):
+    name: str
+
+
+class BrandOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+
+
+class StoreCreate(BaseModel):
+    """Platform-admin only. Coordinates are not taken here: they come from
+    the address once geocoding exists (Phase 2 of the store plan)."""
+    name: str
+    address: Optional[str] = None
+    brand_id: Optional[str] = None
+
+
+class StoreOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    active: bool
+    brand_id: Optional[str] = None
+
+
+class StoreStaffCreate(BaseModel):
+    """
+    Links a new staff account to a store. A store manager adds people to
+    their own store; a platform admin can add the first manager to any store
+    or brand. `store_id` and `brand_id` are exclusive: a store account is
+    linked to one store, a brand account to a whole chain.
+    """
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=72)
+    full_name: Optional[str] = None
+    role: Literal["staff", "manager"] = "staff"
+    store_id: Optional[str] = None
+    brand_id: Optional[str] = None
 
 
 class PantryCreate(BaseModel):

@@ -93,6 +93,49 @@ class UserRole(str, enum.Enum):
     ORG_COORDINATOR = "org_coordinator"
 
 
+class Brand(Base):
+    """
+    A chain with several locations. Exists so that staff of one chain can see
+    every location of that chain and nothing belonging to another chain. A
+    store that is not part of a chain has no brand.
+    """
+    __tablename__ = "brands"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Store(Base):
+    """
+    One physical location that stocks shelves: a grocery store or market.
+
+    Every store-owned row (shelves, items, intake scans, donation records)
+    carries a store_id, and every staff query is scoped by it, so one store's
+    staff cannot read or change another store's stock (NFR-4.6.1).
+
+    Coordinates are filled in once, from the address, when the store is set
+    up. Left null when geocoding fails; such a store is simply not drawn on
+    the pantry map, and nothing else is blocked by it.
+    """
+    __tablename__ = "stores"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    name = Column(String, nullable=False)
+    address = Column(String, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+
+    # Inactive stores keep their history, but their food is withdrawn from
+    # the pantry pool and their staff see an empty view (auth.visible_store_ids).
+    active = Column(Boolean, default=True, nullable=False)
+
+    brand_id = Column(UUID(as_uuid=False), ForeignKey("brands.id"), nullable=True)
+    brand = relationship("Brand")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -109,6 +152,12 @@ class User(Base):
     pantry_id = Column(UUID(as_uuid=False), ForeignKey("pantries.id"), nullable=True)
     pantry = relationship("Pantry", back_populates="users")
 
+    # Store roles belong to one store, or to a brand (every store in it).
+    # Exactly one of these is set for a store role; both are null for
+    # organizers and platform admins. See auth.visible_store_ids.
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=True, index=True)
+    brand_id = Column(UUID(as_uuid=False), ForeignKey("brands.id"), nullable=True)
+
     is_active = Column(Boolean, default=True, nullable=False)
     last_login_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -118,6 +167,7 @@ class Shelf(Base):
     __tablename__ = "shelves"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=True, index=True)
     name = Column(String, nullable=False)          # e.g. "Shelf A - Dairy"
     location = Column(String, nullable=True)        # store / aisle description
     camera_id = Column(String, nullable=True)
@@ -237,6 +287,8 @@ class Item(Base):
     product_id = Column(UUID(as_uuid=False), ForeignKey("products.id"), nullable=True)
     product = relationship("Product")
 
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=True, index=True)
+
     sell_by_date = Column(DateTime, nullable=True, index=True)
     # NFR-4.8.2: a hard safety limit, distinct from the retail date. When
     # present it caps discard_after — nothing is donated past it.
@@ -319,6 +371,8 @@ class IntakeScan(Base):
     image_url = Column(String, nullable=True)
 
     # ---- Manual confirmation ----
+    # The location where the scan was made. Items created from it inherit it.
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=True, index=True)
     status = Column(SAEnum(ScanStatus), default=ScanStatus.PENDING, nullable=False, index=True)
     shelf_id = Column(UUID(as_uuid=False), ForeignKey("shelves.id"), nullable=True)
     quantity = Column(Integer, default=1, nullable=False)
@@ -421,6 +475,10 @@ class DonationRecord(Base):
 
     pantry_id = Column(UUID(as_uuid=False), ForeignKey("pantries.id"), nullable=False, index=True)
     pantry_name_at_handoff = Column(String, nullable=False)
+
+    # The store the food came from, copied at handoff so a store's own
+    # records are filtered without a join that a later edit could change.
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=True, index=True)
 
     confirmed_by_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
     confirmed_at = Column(DateTime, nullable=False, index=True)
