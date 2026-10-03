@@ -105,18 +105,24 @@ a map and choose what to reserve.
 - The map is in scope for the presentation, so Phases 1–4 are all needed
   (confirmed).
 
+- Intake and pickup happen at the location where the scan is made. A brand
+  user can scan at any location of their brand, but each record is tied to
+  the location where it was made.
+- The pantry map shows one marker per shelf location, not per brand. Each
+  marker lists the items on that location's shelves. The pantry chooses the
+  location; the location is not chosen by the pantry's address.
+- The first account for a store is created by a **store admin**. That person
+  creates the store's shelves and links staff accounts to the store. Brand
+  accounts are linked by a platform admin.
+
 ## Open questions
 
-- Can brand-level staff scan intake or confirm pickups at any location of
-  their brand, or only at the one they are physically at? (Proposed: intake
-  and pickup are tied to the location the scan is made at, and brand staff
-  may pick any of their locations.)
-- Should a brand's locations appear on the pantry map as separate markers,
-  or grouped under one brand? (Proposed: separate markers, each with its own
-  address and items.)
+- **Store admin role.** The code already has `manager` (provisions staff) and
+  `admin` (platform-level). The store admin could be the existing `manager`
+  role, scoped to one store, or a new role. Proposed: reuse `manager` for a
+  store admin, and keep platform `admin` for brand linking and verification.
+  This needs your confirmation, because it changes who can create accounts.
 - Is a shared product catalog across stores acceptable? (Proposed: yes.)
-- Who creates brands and links accounts to them? (Proposed: an admin, not
-  self-service, for now.)
 
 ## Risks
 
