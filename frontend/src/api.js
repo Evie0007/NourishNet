@@ -163,6 +163,7 @@ export const api = {
 
   // ---- donation reports (FR-11.1 / FR-11.3), staff-only ----
   listDonations: (filters) => request(`/reports/donations${donationQuery(filters)}`),
+  summarizeDonations: (filters) => request(`/reports/donations/summary${donationQuery(filters)}`),
   // A plain <a href> can't carry the bearer token, so this fetches the CSV
   // as a blob and hands the browser a throwaway object URL to save it from.
   downloadDonationsCsv: async (filters) => {

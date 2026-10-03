@@ -7,6 +7,7 @@ own financial record, not something a pantry organizer has any claim to.
 import csv
 import io
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends
@@ -30,6 +31,17 @@ def list_donations(
     return crud.list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
 
 
+@router.get("/donations/summary", response_model=list[schemas.DonationYearSummaryOut])
+def summarize_donations(
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    pantry_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_staff),
+):
+    return crud.summarize_donations_by_year(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+
+
 @router.get("/donations/export")
 def export_donations(
     date_from: Optional[datetime] = None,
@@ -39,7 +51,9 @@ def export_donations(
     user: models.User = Depends(auth.require_staff),
 ):
     """Same rows as list_donations, as a CSV a person can hand to an
-    accountant without also giving them API access."""
+    accountant without also giving them API access. Trailing subtotal rows
+    (FR-11.8) are grouped by calendar tax year, honoring the same filters
+    as the detail rows above them so the two always agree."""
     records = crud.list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
 
     buffer = io.StringIO()
@@ -60,6 +74,15 @@ def export_donations(
             r.pantry_name_at_handoff,
             r.reservation_id,
         ])
+
+    year_totals = crud.summarize_donations_by_year(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    writer.writerow([])
+    writer.writerow(["Tax year", "Total value", "Item count"])
+    grand_total = Decimal("0")
+    for row in year_totals:
+        writer.writerow([row["tax_year"], row["total_value"], row["item_count"]])
+        grand_total += row["total_value"]
+    writer.writerow(["Total", grand_total, sum(row["item_count"] for row in year_totals)])
     buffer.seek(0)
 
     filename = f"donations_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"

@@ -478,3 +478,11 @@ class DonationRecordOut(BaseModel):
     pantry_name_at_handoff: str
     confirmed_by_user_id: str
     confirmed_at: datetime
+
+
+class DonationYearSummaryOut(BaseModel):
+    """One calendar-year row for the tax summary (FR-11.8)."""
+    tax_year: int
+    total_value: Decimal
+    item_count: int
+    unvalued_item_count: int

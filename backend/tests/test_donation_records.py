@@ -124,6 +124,20 @@ def test_donations_export_returns_csv_with_the_expected_rows(client, picked_up_r
     assert "2.5" in lines[1] or "2.50" in lines[1]
 
 
+def test_donations_export_includes_tax_year_subtotals(client, db, picked_up_reservation, staff_headers):
+    record = db.query(models.DonationRecord).one()
+    record.confirmed_at = datetime(2024, 6, 1)
+    db.commit()
+
+    res = client.get("/reports/donations/export", headers=staff_headers)
+    assert res.status_code == 200
+    lines = res.text.strip().splitlines()
+
+    assert ["Tax year", "Total value", "Item count"] in [line.split(",") for line in lines]
+    assert "2024,2.5,1" in res.text or "2024,2.50,1" in res.text
+    assert "Total,2.5,1" in res.text or "Total,2.50,1" in res.text
+
+
 def test_donations_report_requires_staff_role(client, organizer_headers):
     """FR-11.3 — this is the store's own tax data, not a pantry's."""
     res = client.get("/reports/donations", headers=organizer_headers)
@@ -131,3 +145,62 @@ def test_donations_report_requires_staff_role(client, organizer_headers):
 
     res = client.get("/reports/donations/export", headers=organizer_headers)
     assert res.status_code == 403
+
+    res = client.get("/reports/donations/summary", headers=organizer_headers)
+    assert res.status_code == 403
+
+
+def test_donation_summary_groups_by_calendar_year(
+    client, db, staff_headers, organizer_headers, other_organizer_headers
+):
+    older = _valued_item(db, name="Older", sku="Y1", unit_value=1.00)
+    newer = _valued_item(db, name="Newer", sku="Y2", unit_value=3.00)
+    _donate(client, db, organizer_headers, staff_headers, older)
+    _donate(client, db, other_organizer_headers, staff_headers, newer)
+
+    records = db.query(models.DonationRecord).all()
+    records[0].confirmed_at = datetime(2023, 12, 31)
+    records[1].confirmed_at = datetime(2024, 1, 15)
+    db.commit()
+
+    res = client.get("/reports/donations/summary", headers=staff_headers)
+    assert res.status_code == 200
+    rows = res.json()
+
+    assert [r["tax_year"] for r in rows] == [2024, 2023]
+    by_year = {r["tax_year"]: r for r in rows}
+    assert by_year[2023]["item_count"] == 1
+    assert float(by_year[2023]["total_value"]) == 1.00
+    assert by_year[2024]["item_count"] == 1
+    assert float(by_year[2024]["total_value"]) == 3.00
+
+
+def test_donation_summary_excludes_unvalued_items_from_total_but_counts_them(
+    client, db, staff_headers, organizer_headers
+):
+    unvalued = _valued_item(db, name="No price", sku="NP-1", unit_value=None)
+    _donate(client, db, organizer_headers, staff_headers, unvalued)
+
+    res = client.get("/reports/donations/summary", headers=staff_headers)
+    assert res.status_code == 200
+    rows = res.json()
+
+    assert len(rows) == 1
+    assert rows[0]["item_count"] == 1
+    assert rows[0]["unvalued_item_count"] == 1
+    assert float(rows[0]["total_value"]) == 0
+
+
+def test_donation_summary_filters_by_pantry(
+    client, db, staff_headers, organizer_headers, other_organizer_headers, verified_pantry
+):
+    mine = _valued_item(db, name="Mine", sku="S1")
+    theirs = _valued_item(db, name="Theirs", sku="S2")
+    _donate(client, db, organizer_headers, staff_headers, mine)
+    _donate(client, db, other_organizer_headers, staff_headers, theirs)
+
+    res = client.get(f"/reports/donations/summary?pantry_id={verified_pantry.id}", headers=staff_headers)
+    assert res.status_code == 200
+    rows = res.json()
+    assert len(rows) == 1
+    assert rows[0]["item_count"] == 1

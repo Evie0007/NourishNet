@@ -1257,20 +1257,23 @@ function Shelves({ shelves, onError, onChanged }) {
 function DonationReport({ onError }) {
   const [pantries, setPantries] = useState([]);
   const [records, setRecords] = useState([]);
+  const [summary, setSummary] = useState([]);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [filters, setFilters] = useState({ from: "", to: "", pantryId: "" });
 
   const load = useCallback(
-    (f) =>
-      api
-        .listDonations({
-          from: f.from ? `${f.from}T00:00:00Z` : undefined,
-          to: f.to ? `${f.to}T23:59:59Z` : undefined,
-          pantryId: f.pantryId || undefined,
-        })
-        .then(setRecords)
-        .catch((err) => onError(err.message)),
+    (f) => {
+      const apiFilters = {
+        from: f.from ? `${f.from}T00:00:00Z` : undefined,
+        to: f.to ? `${f.to}T23:59:59Z` : undefined,
+        pantryId: f.pantryId || undefined,
+      };
+      return Promise.all([
+        api.listDonations(apiFilters).then(setRecords),
+        api.summarizeDonations(apiFilters).then(setSummary),
+      ]).catch((err) => onError(err.message));
+    },
     [onError],
   );
 
@@ -1306,7 +1309,7 @@ function DonationReport({ onError }) {
     }
   }
 
-  const totalValue = records.reduce((sum, r) => sum + (r.unit_value_at_handoff ? Number(r.unit_value_at_handoff) : 0), 0);
+  const totalValue = summary.reduce((sum, y) => sum + Number(y.total_value), 0);
   const input = "rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100";
 
   return (
@@ -1357,6 +1360,31 @@ function DonationReport({ onError }) {
             Apply
           </button>
         </form>
+
+        {!loading && summary.length > 0 && (
+          <div className="mb-4 overflow-x-auto rounded-lg border border-gray-200">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Tax year</th>
+                  <th className="px-3 py-2 font-medium">Total value</th>
+                  <th className="px-3 py-2 font-medium">Items</th>
+                  <th className="px-3 py-2 font-medium">Unvalued items</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {summary.map((y) => (
+                  <tr key={y.tax_year}>
+                    <td className="px-3 py-2 font-medium">{y.tax_year}</td>
+                    <td className="px-3 py-2 tabular-nums">{formatCurrency(y.total_value)}</td>
+                    <td className="px-3 py-2 tabular-nums text-gray-600">{y.item_count}</td>
+                    <td className="px-3 py-2 tabular-nums text-gray-600">{y.unvalued_item_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
         {loading ? (
           <p className="text-sm text-gray-500">Loading…</p>
