@@ -16,7 +16,11 @@ a map and choose what to reserve.
    cross-database aggregation layer. The spec's own recommendation (C-1,
    NFR-4.6.1) is to add `store_id` and scope every query. This reverses the
    "multi-store tenancy is out of scope" note in the spec, so the spec is
-   updated in the same change.
+   updated in the same change. **Confirmed by the product owner.**
+   A store can belong to a **brand** (a chain with several locations). Staff
+   of a store see only their own store. Staff whose account is linked to a
+   brand see every location of that brand. A store with no brand is a brand
+   of one. See the data model below.
 2. **Leaflet with OpenStreetMap tiles** for the map. No API key or billing
    account. Before a production launch, the tile provider is revisited
    (OpenStreetMap's public tile servers are for light use).
@@ -28,26 +32,15 @@ a map and choose what to reserve.
    seconds. This matches the sweep's one-minute cadence and needs no new
    infrastructure.
 
-## Brands and locations
-
-- A **Brand** groups stores that belong to the same chain (for example, two
-  locations of one market). `Store.brand_id` is nullable: an independent
-  store has no brand.
-- Store staff see their own store's shelves, items, and reservations.
-- Staff of a brand can see every location under that brand, and nothing
-  outside it. A user is tied to a brand, or to a single store, never to
-  both. The token carries the scope, the same way it carries the role.
-- Brand-level access is read-only in the first version: a brand manager can
-  view inventory across locations, but staff actions (intake, confirm,
-  pickup scan) still happen at the store where the shelf is.
-
 ## Visibility rules (unchanged, stated here so they are not lost)
 
 - Pantries see only items in status `available`, and only from stores that
    are active. Items in review, near expiry, reserved by someone else, or
    discarded never appear.
-- Store staff see only their own store's shelves, items, and reservations,
-  unless the brand rule above applies.
+- Store staff see only their own store's shelves, items, and reservations.
+- Brand staff (linked to a brand, not a single store) see the shelves, items,
+  and reservations of every store in that brand. They never see another
+  brand's stores.
 - Organizers still need `verified = true` to reserve (FR-7.5).
 - The pickup QR flow is unchanged: only store staff confirm a pickup.
 
@@ -55,10 +48,12 @@ a map and choose what to reserve.
 
 ### Phase 1 — store scoping (backend, no UI change)
 
-- Add a `Brand` table (`id`, `name`) and a `Store` table: `id`, `name`,
-  `brand_id` (nullable), `address`, `latitude`, `longitude`, `active`.
-- Add a brand or store scope to store-role users, set when the account is
-  created and carried in the token.
+- Add a `Brand` table: `id`, `name`. Optional for a store.
+- Add a `Store` table: `id`, `name`, `address`, `latitude`, `longitude`,
+  `active`, `brand_id` (nullable).
+- Each store-role user has a `store_id`. A brand-role user has a `brand_id`
+  and no store. The role set needs a brand-level role, so this needs a
+  decision on naming before code (e.g. `brand_manager`).
 - Add `store_id` (non-null after migration) to `User` (store roles only),
   `Shelf`, `Item`, `IntakeScan`, `Reservation`'s item path, and `Product`
   only if product catalogs become per-store (decide before building; the
@@ -102,12 +97,26 @@ a map and choose what to reserve.
 - Mark C-1 and NFR-4.6.1 as addressed by Phase 1, with the migration noted.
 - Add FR entries for store setup, geocoding, and the pantry map.
 
+## Decided
+
+- One database, `store_id` on store-owned rows (confirmed).
+- Store staff see only their own store; brand-linked staff see all locations
+  of their brand (confirmed).
+- The map is in scope for the presentation, so Phases 1–4 are all needed
+  (confirmed).
+
 ## Open questions
 
-- Should store staff see other stores' items on the pantry map? (Proposed: no.)
+- Can brand-level staff scan intake or confirm pickups at any location of
+  their brand, or only at the one they are physically at? (Proposed: intake
+  and pickup are tied to the location the scan is made at, and brand staff
+  may pick any of their locations.)
+- Should a brand's locations appear on the pantry map as separate markers,
+  or grouped under one brand? (Proposed: separate markers, each with its own
+  address and items.)
 - Is a shared product catalog across stores acceptable? (Proposed: yes.)
-- Does the presentation require the map to be working, or is the plan with
-  Phase 1 done enough?
+- Who creates brands and links accounts to them? (Proposed: an admin, not
+  self-service, for now.)
 
 ## Risks
 
