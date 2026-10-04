@@ -81,7 +81,12 @@ export default function Intake({ shelves, onError, onChanged }) {
           onCancel={() => setScan(null)}
         />
       ) : (
-        <ScanPanel shelves={shelves} onError={onError} onScanned={setScan} />
+        <ScanPanel
+          shelves={shelves}
+          onError={onError}
+          onScanned={setScan}
+          onQueued={refreshPending}
+        />
       )}
 
       <RipenessCheck />
@@ -119,8 +124,9 @@ export default function Intake({ shelves, onError, onChanged }) {
 
 /* ---------------- Step 1: the UPC scanner ---------------- */
 
-function ScanPanel({ shelves, onError, onScanned }) {
+function ScanPanel({ shelves, onError, onScanned, onQueued }) {
   const [upc, setUpc] = useState("");
+  const [added, setAdded] = useState([]);
   const [lookup, setLookup] = useState(null);
   const [shelfId, setShelfId] = useState("");
   const [quantity, setQuantity] = useState(1);
@@ -155,17 +161,40 @@ function ScanPanel({ shelves, onError, onScanned }) {
     [onError],
   );
 
-  // The camera hands over digits and gets out of the way. It closes on a
-  // hit so the preview isn't still running while someone reads the result,
-  // and the code lands in the same field a typed one would, so there is
-  // only ever one path from "a number" to "a product".
+  // Shelf and units are read through a ref so the camera callback below
+  // keeps one identity while someone edits them: the scanner restarts the
+  // camera whenever its callback changes.
+  const batchSettings = useRef({ shelfId, quantity });
+  useEffect(() => {
+    batchSettings.current = { shelfId, quantity };
+  }, [shelfId, quantity]);
+
+  // Camera reads go straight into the queue and the camera stays open for
+  // the next box — no Look up, no Start intake, no Capture. That is safe
+  // because opening a scan only adds a row to "Waiting on confirmation";
+  // nothing reaches inventory until a person confirms it there. The
+  // lookup runs first so a misread (bad check digit) is refused here
+  // rather than queued, and so the person sees what was just added.
   const handleCameraHit = useCallback(
-    (code) => {
-      setCameraOpen(false);
-      setUpc(code);
-      runLookup(code);
+    async (code) => {
+      onError("");
+      try {
+        const found = await api.lookupUpc(code);
+        const { shelfId: shelf, quantity: units } = batchSettings.current;
+        await api.openScan({
+          upc: found.upc || code,
+          shelf_id: shelf || null,
+          quantity: Number(units) || 1,
+        });
+        setAdded((list) =>
+          [{ id: Date.now(), name: found.product?.name || `UPC ${found.display_upc}` }, ...list].slice(0, 5),
+        );
+        onQueued();
+      } catch (err) {
+        onError(err.message);
+      }
     },
-    [runLookup],
+    [onError, onQueued],
   );
 
   function handleLookup(event) {
@@ -193,7 +222,7 @@ function ScanPanel({ shelves, onError, onScanned }) {
   }
 
   return (
-    <Card title="1 · Scan the barcode">
+    <Card title="1 · Scan the barcode or QR code">
       <form onSubmit={handleLookup} className="flex flex-wrap items-end gap-2">
         <div>
           <label htmlFor="intake-upc" className="block text-xs font-medium text-gray-600">
@@ -270,7 +299,21 @@ function ScanPanel({ shelves, onError, onScanned }) {
       {/* Unmounting rather than hiding: a hidden <video> keeps the camera
           light on, which is alarming in a way no amount of copy fixes. */}
       {cameraOpen && (
-        <BarcodeScanner onDetected={handleCameraHit} onClose={() => setCameraOpen(false)} />
+        <BarcodeScanner
+          mode="intake"
+          onDetected={handleCameraHit}
+          onClose={() => setCameraOpen(false)}
+        />
+      )}
+
+      {/* Camera reads leave this screen where it is, so say what just
+          happened to them. */}
+      {added.length > 0 && (
+        <ul aria-live="polite" className="mt-3 space-y-1 text-sm text-emerald-800">
+          {added.map((entry) => (
+            <li key={entry.id}>✓ Added to the queue: {entry.name}</li>
+          ))}
+        </ul>
       )}
 
       {lookup && (
