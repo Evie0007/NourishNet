@@ -3,6 +3,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { api, parseUtc, toLocalInputValue } from "../api";
 import { useAuth } from "../auth";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
+import StoreMap from "../components/StoreMap";
 
 // Mirrors schemas.SCHEDULE_HORIZON and PICKUP_GRACE on the backend. The
 // server is authoritative — these only shape the control so it cannot
@@ -14,6 +15,11 @@ const GRACE_MINUTES = 30;
 // produce a time the server has since ruled out.
 const HORIZON_BUFFER_MINUTES = 5;
 
+// The map and the list reflect the stores as they are now. A minute is about
+// how long a pantry takes to walk from one shelf to the next, so polling at
+// this rate is as live as the screen needs to be without a socket.
+const MAP_REFRESH_MS = 45_000;
+
 export default function OrganizerDashboard() {
   const { user } = useAuth();
   const [available, setAvailable] = useState([]);
@@ -22,6 +28,10 @@ export default function OrganizerDashboard() {
   const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState("sell_by");
   const [category, setCategory] = useState("");
+  // Stores with a location, for the map. Only the ones on the map can be
+  // picked there; the list still shows food from stores that are not located.
+  const [stores, setStores] = useState([]);
+  const [selectedStoreId, setSelectedStoreId] = useState(null);
   // Which row has its pickup-time picker open. One at a time — a list of
   // half-filled forms is worse than a single focused one.
   const [schedulingId, setSchedulingId] = useState(null);
@@ -30,9 +40,14 @@ export default function OrganizerDashboard() {
 
   const refresh = useCallback(async () => {
     try {
-      const [items, mine] = await Promise.all([api.listItems(), api.myReservations()]);
+      const [items, mine, places] = await Promise.all([
+        api.listItems(),
+        api.myReservations(),
+        api.pantryMap(),
+      ]);
       setAvailable(items);
       setReservations(mine);
+      setStores(places);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -44,6 +59,25 @@ export default function OrganizerDashboard() {
     refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    const id = setInterval(refresh, MAP_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const storeNames = useMemo(
+    () => Object.fromEntries(stores.map((s) => [s.id, s.name])),
+    [stores],
+  );
+
+  const countByStore = useMemo(
+    () =>
+      available.reduce((counts, item) => {
+        counts[item.store_id] = (counts[item.store_id] || 0) + 1;
+        return counts;
+      }, {}),
+    [available],
+  );
+
   const categories = useMemo(
     () => [...new Set(available.map((i) => i.category).filter(Boolean))].sort(),
     [available],
@@ -51,14 +85,18 @@ export default function OrganizerDashboard() {
 
   // FR-8.3
   const visible = useMemo(() => {
-    const rows = category ? available.filter((i) => i.category === category) : available;
+    const rows = available.filter(
+      (i) =>
+        (!category || i.category === category) &&
+        (!selectedStoreId || i.store_id === selectedStoreId),
+    );
     return [...rows].sort((a, b) =>
       sortBy === "name"
         ? a.name.localeCompare(b.name)
         : (parseUtc(a.sell_by_date)?.getTime() ?? Infinity) -
           (parseUtc(b.sell_by_date)?.getTime() ?? Infinity),
     );
-  }, [available, category, sortBy]);
+  }, [available, category, selectedStoreId, sortBy]);
 
   // Soonest pickup first — the API orders by when the reservation was
   // made, which is not the order anyone collects in.
@@ -114,7 +152,46 @@ export default function OrganizerDashboard() {
         <p className="text-sm text-gray-500">Loading…</p>
       ) : (
         <div className="grid gap-6 lg:grid-cols-5">
-          <div className="lg:col-span-3">
+          <div className="space-y-6 lg:col-span-3">
+            {stores.length > 0 && (
+              <Card
+                title="Where the food is"
+                action={
+                  selectedStoreId && (
+                    <button
+                      onClick={() => setSelectedStoreId(null)}
+                      className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+                    >
+                      Show all stores
+                    </button>
+                  )
+                }
+              >
+                <StoreMap
+                  stores={stores}
+                  countByStore={countByStore}
+                  selectedId={selectedStoreId}
+                  onSelect={(id) => setSelectedStoreId(id === selectedStoreId ? null : id)}
+                />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {stores.map((store) => (
+                    <button
+                      key={store.id}
+                      onClick={() => setSelectedStoreId(store.id === selectedStoreId ? null : store.id)}
+                      aria-pressed={store.id === selectedStoreId}
+                      className={`rounded-full border px-3 py-1 text-xs font-medium ${
+                        store.id === selectedStoreId
+                          ? "border-emerald-600 bg-emerald-600 text-white"
+                          : "border-gray-300 text-gray-700 hover:border-emerald-500"
+                      }`}
+                    >
+                      {store.name} · {countByStore[store.id] || 0}
+                    </button>
+                  ))}
+                </div>
+              </Card>
+            )}
+
             <Card
               title={`Available donations (${visible.length})`}
               action={
@@ -155,6 +232,7 @@ export default function OrganizerDashboard() {
                         <div className="min-w-0">
                           <div className="font-medium">{item.name}</div>
                           <div className="mt-0.5 text-xs text-gray-500">
+                            {storeNames[item.store_id] ? `${storeNames[item.store_id]} · ` : ""}
                             {item.category || "Uncategorized"} · sell-by{" "}
                             {formatDate(item.sell_by_date)}
                           </div>
