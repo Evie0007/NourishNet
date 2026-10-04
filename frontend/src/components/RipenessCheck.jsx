@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { analyzeRipeness, describeDaysLeft } from "../ripeness";
 import { describeCameraError } from "../cameraError";
+import { openPreferredCamera } from "../preferredCamera";
 import { Card } from "./Shell";
 
 /**
@@ -52,9 +53,9 @@ export default function RipenessCheck() {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
+      const stream = await openPreferredCamera({
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
       });
       streamRef.current = stream;
       setOpen(true);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { describeCameraError } from "../cameraError";
+import { openPreferredCamera } from "../preferredCamera";
 
 /**
  * Live code scanning from a camera.
@@ -198,21 +199,21 @@ export default function BarcodeScanner({ onDetected, onClose, mode = "retail" })
       }
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId
-            ? { deviceId: { exact: deviceId } }
-            : {
-                // Prefers the rear camera on a phone and is ignored on a
-                // laptop, which has only the one.
-                facingMode: { ideal: "environment" },
-                // A barcode's bars are a few pixels wide at 480p. Asking
-                // for more resolution is the single biggest thing that
-                // decides whether a webcam can read one at all.
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-              },
-          audio: false,
-        });
+        const stream = deviceId
+          ? await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: deviceId } },
+              audio: false,
+            })
+          : await openPreferredCamera({
+              // Prefers the rear camera on a phone and is ignored on a
+              // laptop, which has only the one.
+              facingMode: { ideal: "environment" },
+              // A barcode's bars are a few pixels wide at 480p. Asking
+              // for more resolution is the single biggest thing that
+              // decides whether a webcam can read one at all.
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+            });
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
           return;
