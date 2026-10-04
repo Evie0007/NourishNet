@@ -371,6 +371,24 @@ class StoreOut(BaseModel):
     brand_id: Optional[str] = None
 
 
+class StoreUpdate(BaseModel):
+    """Every field optional. Changing `address` re-runs the geocoder."""
+    name: Optional[str] = None
+    address: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class StoreMapOut(BaseModel):
+    """What a pantry needs to draw a store on the map. Items come from
+    GET /items, which already carries store_id, so they are not repeated here."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    address: Optional[str] = None
+    latitude: float
+    longitude: float
+
+
 class StoreStaffCreate(BaseModel):
     """
     Links a new staff account to a store. A store manager adds people to

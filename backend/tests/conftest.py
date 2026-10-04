@@ -25,6 +25,10 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_DIR}/test.db"
 # expires it, which a background sweep would do first.
 os.environ["SWEEP_ENABLED"] = "false"
 
+# Tests must never reach a geocoding service. Individual tests opt in by
+# monkeypatching geocode.geocode_address.
+os.environ["GEOCODE_ENABLED"] = "false"
+
 # Without this, auth.py generates an ephemeral secret and warns.
 os.environ.setdefault("JWT_SECRET", "test-secret-not-used-anywhere-real")
 

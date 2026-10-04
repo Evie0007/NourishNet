@@ -12,7 +12,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import auth, expiration, models, schemas, upc as upc_lib
+from . import auth, expiration, geocode, models, schemas, upc as upc_lib
 
 # Section 13.1 of the proposal: 95% is the starting confidence target.
 # Kept as a module-level constant so it's easy to tune during testing week
@@ -213,6 +213,16 @@ def list_brands(db: Session):
     return db.query(models.Brand).order_by(models.Brand.name.asc()).all()
 
 
+def _locate(store: models.Store) -> None:
+    """
+    Fill in the store's coordinates from its address. Left empty when the
+    lookup fails, which takes the store off the map and changes nothing else.
+    Only called when the address is set or changes, never on a page load.
+    """
+    coords = geocode.geocode_address(store.address)
+    store.latitude, store.longitude = coords if coords else (None, None)
+
+
 def create_store(db: Session, store: schemas.StoreCreate) -> models.Store:
     db_store = models.Store(
         name=store.name.strip(),
@@ -220,10 +230,42 @@ def create_store(db: Session, store: schemas.StoreCreate) -> models.Store:
         brand_id=store.brand_id,
         active=True,
     )
+    _locate(db_store)
     db.add(db_store)
     db.commit()
     db.refresh(db_store)
     return db_store
+
+
+def update_store(db: Session, store_id: str, patch: schemas.StoreUpdate) -> Optional[models.Store]:
+    """
+    Change a store's details. Re-geocodes only when the address actually
+    changed, so a rename does not spend a lookup.
+    """
+    db_store = db.get(models.Store, store_id)
+    if not db_store:
+        return None
+    data = patch.model_dump(exclude_unset=True)
+    address_changed = "address" in data and data["address"] != db_store.address
+    for field, value in data.items():
+        setattr(db_store, field, value)
+    if address_changed:
+        _locate(db_store)
+    db.commit()
+    db.refresh(db_store)
+    return db_store
+
+
+def list_mappable_stores(db: Session) -> list[models.Store]:
+    """Stores a pantry can be shown on the map: active, and located."""
+    return (
+        db.query(models.Store)
+        .filter(models.Store.active == True)  # noqa: E712
+        .filter(models.Store.latitude.isnot(None))
+        .filter(models.Store.longitude.isnot(None))
+        .order_by(models.Store.name.asc())
+        .all()
+    )
 
 
 def list_stores(db: Session, store_ids: Optional[list[str]] = None):

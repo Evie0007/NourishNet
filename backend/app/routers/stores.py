@@ -39,6 +39,32 @@ def create_store(
     return crud.create_store(db, payload)
 
 
+@router.get("/map", response_model=list[schemas.StoreMapOut])
+def store_map(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_organizer),
+):
+    """
+    Active, located stores for the pantry map (FR-8.3, plan Phase 3). Shows
+    where each store is and nothing about its shelves. Available food comes
+    from GET /items, which is already limited to active stores.
+    """
+    return crud.list_mappable_stores(db)
+
+
+@router.patch("/{store_id}", response_model=schemas.StoreOut)
+def update_store(
+    store_id: str,
+    payload: schemas.StoreUpdate,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_role(models.UserRole.ADMIN)),
+):
+    store = crud.update_store(db, store_id, payload)
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return store
+
+
 @router.get("/brands", response_model=list[schemas.BrandOut])
 def list_brands(
     db: Session = Depends(get_db),
