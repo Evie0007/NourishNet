@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { describeCameraError } from "../cameraError";
+import { beep } from "../beep";
+import { extractGtin } from "../gtin";
+import { openPreferredCamera } from "../preferredCamera";
 
 /**
  * Live code scanning from a camera.
  *
- * Two jobs, chosen with `mode`: retail barcodes at the intake desk
- * (`"retail"`, the default) and pickup QR codes at the shelf (`"qr"`).
+ * Three jobs, chosen with `mode`: retail barcodes only (`"retail"`, the
+ * default), retail barcodes or package QR codes together at the intake desk
+ * (`"intake"`), and pickup QR codes at the shelf (`"qr"`).
  * Everything that differs between them lives in the MODES table below —
  * see the note there on why this is one named mode rather than a handful
  * of independent props.
@@ -47,6 +51,13 @@ const SCAN_INTERVAL_MS = 200;
 // than that they are holding it wrong.
 const COACH_AFTER_MS = 8000;
 
+// In continuous mode the same box sits in front of the camera for as long
+// as it takes to move it, and the decoder reads it five times a second.
+// Without this the unit would be added every 400ms until it was taken away.
+// A different code is accepted at once; the same one has to wait, which is
+// also what lets someone deliberately scan a second unit of the same item.
+const REPEAT_COOLDOWN_MS = 3000;
+
 /**
  * The two things this component is pointed at, and everything that
  * differs between them.
@@ -84,6 +95,39 @@ const MODES = {
     captureFail:
       "Couldn't read that one. Flatten the package so the bars aren't curved, fill " +
       "the white box, and try again — or type the digits under the barcode.",
+    manualHint:
+      "Can't get a read? Close this and type the digits under the barcode — it's the same thing.",
+  },
+  // The intake desk: a retail barcode or a package QR, whichever is on the
+  // box. A QR here carries a GS1 link or element string rather than bare
+  // digits, so `normalize` finds the GTIN inside it instead of stripping
+  // non-digits — see gtin.js. The retail format list is kept as is so a
+  // shipping label's tracking barcode still can't come back as a product.
+  intake: {
+    subject: "barcode or QR code",
+    formats: ["upc_a", "upc_e", "ean_13", "ean_8", "qr_code"],
+    zxingReader: "multi",
+    zxingFormats: ["UPC_A", "UPC_E", "EAN_13", "EAN_8", "QR_CODE"],
+    normalize: extractGtin,
+    // Same two-read rule as retail: it guards the 1D symbols, and a QR
+    // costs nothing extra because both reads decode to the same GTIN.
+    confirmations: 2,
+    // The desk scans a stack of boxes, not one. Each read beeps and is
+    // handed over while the camera stays open for the next; the caller
+    // decides what a read means, and must not write inventory (see Intake).
+    continuous: true,
+    // Tall enough for a square QR, wide enough for a barcode. A QR needs
+    // the height and a 1D barcode only needs the width, so this is a
+    // compromise between the two single-purpose boxes.
+    aimBox: { x: 0.1, y: 0.15, w: 0.8, h: 0.7 },
+    aimHint: "Fill the white box with the barcode or QR code, hold steady, and give it good light.",
+    coachHint:
+      "Still looking. Move closer so the code fills the white box, flatten any " +
+      "curve in the package, add light — or hold it steady and press Capture. " +
+      "A QR code that isn't a product code won't be read.",
+    captureFail:
+      "Couldn't read a product code from that. Flatten the package, fill the white " +
+      "box, and try again — or type the digits under the barcode.",
     manualHint:
       "Can't get a read? Close this and type the digits under the barcode — it's the same thing.",
   },
@@ -142,12 +186,34 @@ export default function BarcodeScanner({ onDetected, onClose, mode = "retail" })
   // state update per frame would re-render the component five times a
   // second for a value nothing displays.
   const lastRead = useRef({ code: null, count: 0 });
+  const lastAccepted = useRef({ code: null, at: 0 });
   const finished = useRef(false);
+
+  // The one place a read becomes a result, shared by the live loop and
+  // Capture so both behave the same in either kind of mode.
+  const accept = useCallback(
+    (code) => {
+      if (cfg.continuous) {
+        lastAccepted.current = { code, at: Date.now() };
+        lastRead.current = { code: null, count: 0 };
+        beep();
+      } else {
+        finished.current = true;
+      }
+      // The server still validates whatever comes out of here — this is
+      // a convenience layer over the keyboard, never a source of trust.
+      onDetected(code);
+    },
+    [onDetected, cfg],
+  );
 
   const handleHit = useCallback(
     (raw) => {
       const code = cfg.normalize(raw);
       if (!code || finished.current) return;
+
+      const { code: acceptedCode, at } = lastAccepted.current;
+      if (code === acceptedCode && Date.now() - at < REPEAT_COOLDOWN_MS) return;
 
       if (lastRead.current.code === code) {
         lastRead.current.count += 1;
@@ -155,14 +221,9 @@ export default function BarcodeScanner({ onDetected, onClose, mode = "retail" })
         lastRead.current = { code, count: 1 };
       }
 
-      if (lastRead.current.count >= cfg.confirmations) {
-        finished.current = true;
-        // The server still validates whatever comes out of here — this is
-        // a convenience layer over the keyboard, never a source of trust.
-        onDetected(code);
-      }
+      if (lastRead.current.count >= cfg.confirmations) accept(code);
     },
-    [onDetected, cfg],
+    [accept, cfg],
   );
 
   const stop = useCallback(() => {
@@ -198,21 +259,21 @@ export default function BarcodeScanner({ onDetected, onClose, mode = "retail" })
       }
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId
-            ? { deviceId: { exact: deviceId } }
-            : {
-                // Prefers the rear camera on a phone and is ignored on a
-                // laptop, which has only the one.
-                facingMode: { ideal: "environment" },
-                // A barcode's bars are a few pixels wide at 480p. Asking
-                // for more resolution is the single biggest thing that
-                // decides whether a webcam can read one at all.
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-              },
-          audio: false,
-        });
+        const stream = deviceId
+          ? await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: deviceId } },
+              audio: false,
+            })
+          : await openPreferredCamera({
+              // Prefers the rear camera on a phone and is ignored on a
+              // laptop, which has only the one.
+              facingMode: { ideal: "environment" },
+              // A barcode's bars are a few pixels wide at 480p. Asking
+              // for more resolution is the single biggest thing that
+              // decides whether a webcam can read one at all.
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+            });
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
           return;
@@ -330,10 +391,13 @@ export default function BarcodeScanner({ onDetected, onClose, mode = "retail" })
       for (const build of attempts) {
         const canvas = build();
         if (!canvas) continue;
-        const code = await decodeCanvas(canvas, detectorRef.current, zxingReaderRef.current);
+        const code = cfg.normalize(
+          await decodeCanvas(canvas, detectorRef.current, zxingReaderRef.current),
+        );
+        // Empty after normalizing means it decoded something that isn't a
+        // product code (intake mode, a recipe QR) — try the next crop.
         if (code) {
-          finished.current = true;
-          onDetected(cfg.normalize(code));
+          accept(code);
           return;
         }
       }
@@ -603,6 +667,18 @@ function runNative(detector, videoRef, canvasRef, onHit, aimBox) {
   // the interval would have its frame redrawn underneath it. Skipping the
   // tick is right anyway: a backlog of stale frames helps nobody.
   let inFlight = false;
+  // Each tick tries a different view of the frame, the way Capture tries
+  // several crops. The aim box alone fails whenever the code isn't quite
+  // inside it, and 1x alone fails when the bars are thin: a 1080p webcam
+  // frame holds a pocket-sized UPC in far fewer pixels than the decoder
+  // wants. Cycling costs nothing extra per tick — still one detect() — and
+  // a code that is found in any of the three is found within ~600ms.
+  const views = [
+    [aimBox, 1],
+    [FULL_FRAME, 1],
+    [aimBox, 2],
+  ];
+  let tick = 0;
 
   const timer = setInterval(async () => {
     const video = videoRef.current;
@@ -610,7 +686,8 @@ function runNative(detector, videoRef, canvasRef, onHit, aimBox) {
     if (stopped || inFlight || !video || video.readyState < 2) return;
     inFlight = true;
     try {
-      const canvas = cropFrame(video, canvasRef, aimBox, 1);
+      const [box, scale] = views[tick++ % views.length];
+      const canvas = cropFrame(video, canvasRef, box, scale);
       if (!canvas) return;
       const found = await detector.detect(canvas);
       if (found.length > 0) onHit(found[0].rawValue);
@@ -647,8 +724,10 @@ async function runZxing(videoRef, stream, readerRef, onHit, cfg) {
   // ZXing is handed a null element and throws where the user sees it.
   if (!videoRef.current) return () => {};
 
-  const [{ BrowserMultiFormatOneDReader, BrowserQRCodeReader }, { BarcodeFormat, DecodeHintType }] =
-    await Promise.all([import("@zxing/browser"), import("@zxing/library")]);
+  const [
+    { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, BrowserQRCodeReader },
+    { BarcodeFormat, DecodeHintType },
+  ] = await Promise.all([import("@zxing/browser"), import("@zxing/library")]);
 
   if (!videoRef.current) return () => {};
 
@@ -659,9 +738,15 @@ async function runZxing(videoRef, stream, readerRef, onHit, cfg) {
     [DecodeHintType.TRY_HARDER, true],
   ]);
 
-  // Both extend BrowserCodeReader and take the same (hints, options), so
-  // decodeCanvas and decodeFromStream work unchanged across the two.
-  const Reader = cfg.zxingReader === "qr" ? BrowserQRCodeReader : BrowserMultiFormatOneDReader;
+  // All three extend BrowserCodeReader and take the same (hints, options),
+  // so decodeCanvas and decodeFromStream work unchanged across them. The
+  // multi-format reader is only for a mode that needs 1D and 2D together.
+  const Reader =
+    cfg.zxingReader === "qr"
+      ? BrowserQRCodeReader
+      : cfg.zxingReader === "multi"
+        ? BrowserMultiFormatReader
+        : BrowserMultiFormatOneDReader;
   const reader = new Reader(hints, {
     delayBetweenScanAttempts: SCAN_INTERVAL_MS,
   });
