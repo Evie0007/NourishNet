@@ -23,9 +23,12 @@ def add_item(
     `POST /intake/scans`, which records what the scanners saw and who
     confirmed it.
     """
+    store_id = auth.resolve_write_store(db, user, item.store_id)
     try:
-        return crud.create_item(db, item)
+        return crud.create_item(db, item, store_id)
     except upc_lib.InvalidBarcode as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
 
@@ -36,14 +39,14 @@ def query_items(
     user: models.User = Depends(auth.get_current_user),
 ):
     """
-    Staff see the full inventory in any status. Organizers see the donation
-    pool and nothing else — the store's in-stock shelf contents are not
-    theirs to browse, so their status filter is overridden rather than
-    merely defaulted.
+    Staff see their store's inventory in any status. Organizers see the
+    donation pool across every active store, and nothing else: the stores'
+    in-stock shelf contents are not theirs to browse, so their status filter
+    is overridden rather than merely defaulted.
     """
     if user.role == models.UserRole.ORG_COORDINATOR:
-        status = models.ItemStatus.AVAILABLE
-    return crud.list_items(db, status=status)
+        return crud.list_items(db, status=models.ItemStatus.AVAILABLE, active_stores_only=True)
+    return crud.list_items(db, status=status, store_ids=auth.visible_store_ids(db, user))
 
 
 @router.get("/near-expiry", response_model=list[schemas.ItemOut])
@@ -53,7 +56,7 @@ def near_expiry(
     user: models.User = Depends(auth.require_staff),
 ):
     """Items whose sell-by date is within `within_hours` from now."""
-    return crud.list_near_expiry(db, within_hours=within_hours)
+    return crud.list_near_expiry(db, within_hours=within_hours, store_ids=auth.visible_store_ids(db, user))
 
 
 @router.post("/run-expiration-sweep", response_model=schemas.SweepResultOut)
@@ -80,7 +83,9 @@ def get_item(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    item = crud.get_item(db, item_id)
+    # Another store's item is reported as missing, not forbidden: a 403
+    # would confirm that it exists (FR-2.4).
+    item = crud.get_item(db, item_id, store_ids=auth.visible_store_ids(db, user))
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     return item
@@ -93,7 +98,7 @@ def update_status(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    item = crud.update_item_status(db, item_id, payload.status)
+    item = crud.update_item_status(db, item_id, payload.status, store_ids=auth.visible_store_ids(db, user))
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     return item
@@ -114,7 +119,7 @@ def submit_ocr_result(
     FR-1.11: the pipeline should hold its own service credential rather
     than borrowing a staff token. Not yet built.
     """
-    item = crud.apply_ocr_result(db, item_id, result)
+    item = crud.apply_ocr_result(db, item_id, result, store_ids=auth.visible_store_ids(db, user))
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     return item

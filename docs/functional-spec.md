@@ -50,7 +50,7 @@ NourishNet reduces grocery-retail food waste by automating the path from "this i
 - QR-code-based pickup verification at the shelf
 - Automatic release of reservations whose hold window lapses
 
-**Out of scope** — see [Section 10](#10-out-of-scope-and-future-work) for the full list. Briefly: multi-store tenancy, delivery logistics and driver routing, native mobile applications, and point-of-sale integration.
+**Out of scope** — see [Section 10](#10-out-of-scope-and-future-work) for the full list. Briefly: delivery logistics and driver routing, native mobile applications, and point-of-sale integration.
 
 **System boundary.** NourishNet does not take physical custody of food and does not transport it. It records state, brokers reservations, and verifies handoffs. Physical food safety judgment remains with store staff at all times ([FR-6.7](#fr-6-item-lifecycle-and-status-transitions), [NFR-4.8](#48-legal-and-food-safety-compliance)).
 
@@ -176,7 +176,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 ### 2.5 Design and Implementation Constraints
 
-- **C-1 — Single store.** The schema has no store or tenant identifier. All shelves, items, and reservations belong to one implicit store. Multi-store operation requires a schema change ([NFR-4.6](#46-scalability)).
+- **C-1 — Multi-store.** Each store or market is its own tenant. Shelves, items, intake scans and donation records carry a `store_id`, and every staff query is scoped to the caller's store or brand ([NFR-4.6.1](#46-scalability)). Organizations see available food from all active stores.
 - **C-2 — Network dependency at the shelf.** Sensor readings and label captures require connectivity. The system has no offline queue; a network outage at the shelf means readings are lost, not buffered.
 - **C-3 — Vision API dependency.** Label reading is unavailable when the Google Cloud Vision API is unreachable. The system MUST degrade to manual entry rather than blocking ([FR-5.7](#fr-5-ocr--cv-label-pipeline-and-confidence-branch)).
 - **C-4 — Prototype-grade SKU matching.** The current cross-check is literal substring matching against OCR text (`ocr.py:92-105`), which the source file's own docstring identifies as fragile. Replacing it with barcode detection is planned but not in this revision's scope.
@@ -511,7 +511,7 @@ NourishNet sits between a grocery store's physical shelves and a network of nonp
 
 | ID | Requirement |
 |---|---|
-| **NFR-4.6.1** | The schema has **no store or tenant identifier**. Shelf, Item, and Reservation all assume a single store (`app/models.py`). Multi-store support requires adding `store_id` to Shelf and scoping every query — a change to make deliberately, before there is production data. |
+| **NFR-4.6.1** | Store-owned rows carry a `store_id` (`app/models.py`). Every staff read and write is scoped by the caller's store, or by brand for a brand-linked account (`app/auth.py:visible_store_ids`). An account linked to no store sees nothing. A record that belongs to another store is reported as not found, never forbidden. Store-scoping tests are in `backend/tests/test_store_scoping.py`. |
 | **NFR-4.6.2** | Production MUST use PostgreSQL, not SQLite. SQLite's write locking will not survive concurrent reservation traffic. |
 | **NFR-4.6.3** | Indexes MUST exist on `Item.status`, `Item.sell_by_date`, `Reservation.status`, and `Reservation.hold_expires_at` — the columns the hot queries filter on. Only `Item.sku` is indexed today (`app/models.py:63`). |
 | **NFR-4.6.4** | The system MUST adopt Alembic migrations before holding data that cannot be dropped ([C-5](#25-design-and-implementation-constraints)). |
@@ -1139,7 +1139,7 @@ An item belongs to at most one shelf and may have many reservations over its lif
 | `current_humidity_pct` | Float | Nullable | ✅ |
 | `last_reading_at` | DateTime | Nullable, UTC | ✅ |
 | `created_at` | DateTime | Default now, UTC | ✅ |
-| `store_id` | UUID | FK → Store | ○ *(needed for multi-store, NFR-4.6.1)* |
+| `store_id` | UUID | FK → Store | ✅ *(NFR-4.6.1)* |
 | `safe_temp_min_c` / `safe_temp_max_c` | Float | Nullable — excursion bounds | ○ *(FR-4.6)* |
 
 ### 6.3 ShelfReading — proposed
@@ -1469,7 +1469,7 @@ Errors return `{"detail": "<message>"}`, matching FastAPI's convention and the f
 
 | Item | Rationale |
 |---|---|
-| **Multi-store tenancy** | The schema assumes one store (NFR-4.6.1). Supporting a chain means a Store entity and scoping every query. Best done before production data exists. |
+| **Store map and geocoding** | Stores are not yet placed on a map. Coordinates are stored but not filled in from addresses (plan: `docs/multi-store-map-plan.md`, Phases 2–3). |
 | **Delivery and driver routing** | Organizations collect in person. Volunteer-driver dispatch is a separate product. |
 | **Native mobile applications** | The responsive web client covers the QR-presentation and scanning flows. |
 | **Point-of-sale integration** | Automatic SKU catalog synchronization and sale-triggered item removal require store IT engagement beyond this revision. |

@@ -85,9 +85,12 @@ def open_scan(
     throwing away food over a printing defect. A scan with no UPC is
     confirmed the same way; the person types the name.
     """
+    store_id = auth.resolve_write_store(db, user, scan.store_id)
     try:
-        return _decorate(db, crud.create_intake_scan(db, scan, user.id))
+        return _decorate(db, crud.create_intake_scan(db, scan, user.id, store_id))
     except upc_lib.InvalidBarcode as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
 
@@ -100,8 +103,12 @@ def list_scans(
 ):
     """The pending queue, oldest first. Pass ?status=confirmed to read back
     the intake log — every read, what the machine proposed, and what the
-    person accepted (FR-5.10, FR-11.5)."""
-    return [_decorate(db, scan) for scan in crud.list_intake_scans(db, status=status, limit=limit)]
+    person accepted (FR-5.10, FR-11.5). Scoped to the caller's stores."""
+    store_ids = auth.visible_store_ids(db, user)
+    return [
+        _decorate(db, scan)
+        for scan in crud.list_intake_scans(db, status=status, limit=limit, store_ids=store_ids)
+    ]
 
 
 @router.get("/scans/{scan_id}", response_model=schemas.IntakeScanOut)
@@ -110,7 +117,7 @@ def get_scan(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    scan = db.get(models.IntakeScan, scan_id)
+    scan = crud.get_scan(db, scan_id, store_ids=auth.visible_store_ids(db, user))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     return _decorate(db, scan)
@@ -133,7 +140,7 @@ def submit_date_result(
     FR-1.11: a pipeline running unattended should hold its own service
     credential rather than borrowing a staff token. Still outstanding.
     """
-    scan = crud.apply_intake_date(db, scan_id, result)
+    scan = crud.apply_intake_date(db, scan_id, result, store_ids=auth.visible_store_ids(db, user))
     if not scan:
         raise HTTPException(
             status_code=404,
@@ -182,7 +189,7 @@ async def submit_label_image(
         date_candidates=[c.as_dict() for c in result.candidates] or None,
     )
 
-    scan = crud.apply_intake_date(db, scan_id, payload)
+    scan = crud.apply_intake_date(db, scan_id, payload, store_ids=auth.visible_store_ids(db, user))
     if not scan:
         raise HTTPException(
             status_code=404,
@@ -210,7 +217,12 @@ def confirm_scan(
     creating a second set of items, so a double-tapped Confirm button on a
     phone at the dock cannot duplicate a pallet.
     """
-    result = crud.confirm_intake_scan(db, scan_id, payload, user.id)
+    try:
+        result = crud.confirm_intake_scan(
+            db, scan_id, payload, user.id, store_ids=auth.visible_store_ids(db, user)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     if result is None:
         raise HTTPException(
             status_code=409,
@@ -231,7 +243,9 @@ def reject_scan(
     Refuse a scan. No item is created and no reason is required
     (NFR-4.8.4). The scan stays as the record of what was turned away.
     """
-    scan = crud.reject_intake_scan(db, scan_id, payload.notes, user.id)
+    scan = crud.reject_intake_scan(
+        db, scan_id, payload.notes, user.id, store_ids=auth.visible_store_ids(db, user)
+    )
     if not scan:
         raise HTTPException(
             status_code=409,

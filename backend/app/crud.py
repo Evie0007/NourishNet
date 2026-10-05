@@ -9,10 +9,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import auth, expiration, models, schemas, upc as upc_lib
+from . import auth, expiration, geocode, models, schemas, upc as upc_lib
 
 # Section 13.1 of the proposal: 95% is the starting confidence target.
 # Kept as a module-level constant so it's easy to tune during testing week
@@ -22,16 +22,36 @@ CONFIDENCE_THRESHOLD = 0.95
 
 # ---------- Shelves ----------
 
-def create_shelf(db: Session, shelf: schemas.ShelfCreate) -> models.Shelf:
-    db_shelf = models.Shelf(**shelf.model_dump())
+def _in_scope(query, model, store_ids: Optional[list[str]]):
+    """
+    Restrict a query to the stores a caller may see. `None` is unrestricted
+    (platform admin only). An empty list matches nothing, which is what an
+    unlinked account should get.
+    """
+    if store_ids is None:
+        return query
+    return query.filter(model.store_id.in_(store_ids))
+
+
+def shelf_in_store(db: Session, shelf_id: str, store_id: str) -> bool:
+    shelf = db.get(models.Shelf, shelf_id)
+    return shelf is not None and shelf.store_id == store_id
+
+
+def create_shelf(db: Session, shelf: schemas.ShelfCreate, store_id: str) -> models.Shelf:
+    """The store is the one the caller resolved (auth.resolve_write_store),
+    never whatever the body said (NFR-4.6.1)."""
+    db_shelf = models.Shelf(**shelf.model_dump(exclude={"store_id"}), store_id=store_id)
     db.add(db_shelf)
     db.commit()
     db.refresh(db_shelf)
     return db_shelf
 
 
-def update_shelf_reading(db: Session, shelf_id: str, reading: schemas.ShelfReadingUpdate) -> Optional[models.Shelf]:
-    db_shelf = db.get(models.Shelf, shelf_id)
+def update_shelf_reading(
+    db: Session, shelf_id: str, reading: schemas.ShelfReadingUpdate, store_ids: Optional[list[str]]
+) -> Optional[models.Shelf]:
+    db_shelf = _in_scope(db.query(models.Shelf).filter(models.Shelf.id == shelf_id), models.Shelf, store_ids).first()
     if not db_shelf:
         return None
     if reading.current_temperature_c is not None:
@@ -44,13 +64,13 @@ def update_shelf_reading(db: Session, shelf_id: str, reading: schemas.ShelfReadi
     return db_shelf
 
 
-def list_shelves(db: Session):
-    return db.query(models.Shelf).all()
+def list_shelves(db: Session, store_ids: Optional[list[str]] = None):
+    return _in_scope(db.query(models.Shelf), models.Shelf, store_ids).all()
 
 
 # ---------- Items ----------
 
-def create_item(db: Session, item: schemas.ItemCreate) -> models.Item:
+def create_item(db: Session, item: schemas.ItemCreate, store_id: str) -> models.Item:
     """
     Manual item creation — the path for stock that never crossed the
     intake station (a correction, a backfill, a partner drop-off).
@@ -63,6 +83,12 @@ def create_item(db: Session, item: schemas.ItemCreate) -> models.Item:
     """
     data = item.model_dump()
     raw_upc = data.pop("upc", None)
+    data["store_id"] = store_id
+
+    if data.get("shelf_id") and not shelf_in_store(db, data["shelf_id"], store_id):
+        # A shelf from another store is the same as no shelf: the item is
+        # not placed anywhere this store could not see.
+        raise ValueError("That shelf is not one of your store's shelves.")
 
     product = None
     if raw_upc:
@@ -92,32 +118,46 @@ def create_item(db: Session, item: schemas.ItemCreate) -> models.Item:
     return db_item
 
 
-def get_item(db: Session, item_id: str) -> Optional[models.Item]:
-    return db.get(models.Item, item_id)
+def get_item(db: Session, item_id: str, store_ids: Optional[list[str]] = None) -> Optional[models.Item]:
+    return _in_scope(db.query(models.Item).filter(models.Item.id == item_id), models.Item, store_ids).first()
 
 
-def list_items(db: Session, status: Optional[models.ItemStatus] = None):
+def list_items(
+    db: Session,
+    status: Optional[models.ItemStatus] = None,
+    store_ids: Optional[list[str]] = None,
+    active_stores_only: bool = False,
+):
+    """
+    `store_ids` scopes staff views. `active_stores_only` is for the pantry
+    side: food from every active store is offered, and a deactivated store's
+    food is withdrawn from the pool without touching its own records.
+    """
     q = db.query(models.Item)
+    q = _in_scope(q, models.Item, store_ids)
+    if active_stores_only:
+        q = q.join(models.Store, models.Item.store_id == models.Store.id).filter(models.Store.active == True)  # noqa: E712
     if status:
         q = q.filter(models.Item.status == status)
     return q.order_by(models.Item.sell_by_date.asc().nullslast()).all()
 
 
-def list_near_expiry(db: Session, within_hours: int = 48):
+def list_near_expiry(db: Session, within_hours: int = 48, store_ids: Optional[list[str]] = None):
     """Items whose sell-by date falls within the given window from now."""
     cutoff = datetime.utcnow() + timedelta(hours=within_hours)
-    return (
+    q = (
         db.query(models.Item)
         .filter(models.Item.sell_by_date != None)  # noqa: E711
         .filter(models.Item.sell_by_date <= cutoff)
         .filter(models.Item.status.in_([models.ItemStatus.IN_STOCK, models.ItemStatus.NEAR_EXPIRY]))
-        .order_by(models.Item.sell_by_date.asc())
-        .all()
     )
+    return _in_scope(q, models.Item, store_ids).order_by(models.Item.sell_by_date.asc()).all()
 
 
-def update_item_status(db: Session, item_id: str, status: models.ItemStatus) -> Optional[models.Item]:
-    db_item = db.get(models.Item, item_id)
+def update_item_status(
+    db: Session, item_id: str, status: models.ItemStatus, store_ids: Optional[list[str]] = None
+) -> Optional[models.Item]:
+    db_item = get_item(db, item_id, store_ids)
     if not db_item:
         return None
     db_item.status = status
@@ -126,13 +166,15 @@ def update_item_status(db: Session, item_id: str, status: models.ItemStatus) -> 
     return db_item
 
 
-def apply_ocr_result(db: Session, item_id: str, result: schemas.ItemOCRResult) -> Optional[models.Item]:
+def apply_ocr_result(
+    db: Session, item_id: str, result: schemas.ItemOCRResult, store_ids: Optional[list[str]] = None
+) -> Optional[models.Item]:
     """
     Core confidence-branch logic from Section 9.3 / 13.1 of the proposal:
       - confidence >= threshold AND SKU match confirmed -> auto-log, mark AVAILABLE
       - otherwise -> NEEDS_REVIEW, an employee has to confirm it
     """
-    db_item = db.get(models.Item, item_id)
+    db_item = get_item(db, item_id, store_ids)
     if not db_item:
         return None
 
@@ -155,6 +197,105 @@ def apply_ocr_result(db: Session, item_id: str, result: schemas.ItemOCRResult) -
     db.commit()
     db.refresh(db_item)
     return db_item
+
+
+# ---------- Brands and stores ----------
+
+def create_brand(db: Session, brand: schemas.BrandCreate) -> models.Brand:
+    db_brand = models.Brand(name=brand.name.strip())
+    db.add(db_brand)
+    db.commit()
+    db.refresh(db_brand)
+    return db_brand
+
+
+def list_brands(db: Session):
+    return db.query(models.Brand).order_by(models.Brand.name.asc()).all()
+
+
+def _locate(store: models.Store) -> None:
+    """
+    Fill in the store's coordinates from its address. Left empty when the
+    lookup fails, which takes the store off the map and changes nothing else.
+    Only called when the address is set or changes, never on a page load.
+    """
+    coords = geocode.geocode_address(store.address)
+    store.latitude, store.longitude = coords if coords else (None, None)
+
+
+def create_store(db: Session, store: schemas.StoreCreate) -> models.Store:
+    db_store = models.Store(
+        name=store.name.strip(),
+        address=store.address,
+        brand_id=store.brand_id,
+        active=True,
+    )
+    _locate(db_store)
+    db.add(db_store)
+    db.commit()
+    db.refresh(db_store)
+    return db_store
+
+
+def update_store(db: Session, store_id: str, patch: schemas.StoreUpdate) -> Optional[models.Store]:
+    """
+    Change a store's details. Re-geocodes only when the address actually
+    changed, so a rename does not spend a lookup.
+    """
+    db_store = db.get(models.Store, store_id)
+    if not db_store:
+        return None
+    data = patch.model_dump(exclude_unset=True)
+    address_changed = "address" in data and data["address"] != db_store.address
+    for field, value in data.items():
+        setattr(db_store, field, value)
+    if address_changed:
+        _locate(db_store)
+    db.commit()
+    db.refresh(db_store)
+    return db_store
+
+
+def list_mappable_stores(db: Session) -> list[models.Store]:
+    """Stores a pantry can be shown on the map: active, and located."""
+    return (
+        db.query(models.Store)
+        .filter(models.Store.active == True)  # noqa: E712
+        .filter(models.Store.latitude.isnot(None))
+        .filter(models.Store.longitude.isnot(None))
+        .order_by(models.Store.name.asc())
+        .all()
+    )
+
+
+def list_stores(db: Session, store_ids: Optional[list[str]] = None):
+    """`store_ids` is the caller's visible set. None is every store, which
+    is the platform admin's view."""
+    q = db.query(models.Store)
+    if store_ids is not None:
+        q = q.filter(models.Store.id.in_(store_ids))
+    return q.order_by(models.Store.name.asc()).all()
+
+
+def create_store_user(db: Session, payload: schemas.StoreStaffCreate) -> models.User:
+    """
+    Creates a staff or manager account linked to exactly one store, or to a
+    brand. The caller has already been checked against the link it asks for
+    (see the stores router); this function only writes it.
+    """
+    user = models.User(
+        email=payload.email.strip(),
+        password_hash=auth.hash_password(payload.password),
+        full_name=payload.full_name,
+        role=models.UserRole(payload.role),
+        store_id=payload.store_id,
+        brand_id=payload.brand_id,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 # ---------- Product catalog (UPC scanner) ----------
@@ -294,14 +435,20 @@ def recompute_deadlines_for_category(db: Session, category: str) -> int:
 # ---------- Intake scans (UPC + OCR + manual confirmation) ----------
 
 def create_intake_scan(
-    db: Session, scan: schemas.IntakeScanCreate, user_id: Optional[str]
+    db: Session, scan: schemas.IntakeScanCreate, user_id: Optional[str], store_id: str
 ) -> models.IntakeScan:
     """
     Open a scan. The barcode is resolved against the catalog here so the
     confirmation screen has a product name the moment the code is read.
+
+    The scan belongs to the location it was made at (store_id), and so does
+    any shelf it is placed on.
     """
-    data = scan.model_dump()
+    data = scan.model_dump(exclude={"store_id"})
     raw_upc = data.pop("upc", None)
+
+    if data.get("shelf_id") and not shelf_in_store(db, data["shelf_id"], store_id):
+        raise ValueError("That shelf is not one of your store's shelves.")
 
     product = None
     normalized = None
@@ -313,6 +460,7 @@ def create_intake_scan(
         upc=normalized,
         product_id=product.id if product else None,
         scanned_by_id=user_id,
+        store_id=store_id,
     )
     db.add(db_scan)
     db.commit()
@@ -320,8 +468,12 @@ def create_intake_scan(
     return db_scan
 
 
+def get_scan(db: Session, scan_id: str, store_ids: Optional[list[str]] = None) -> Optional[models.IntakeScan]:
+    return _in_scope(db.query(models.IntakeScan).filter(models.IntakeScan.id == scan_id), models.IntakeScan, store_ids).first()
+
+
 def apply_intake_date(
-    db: Session, scan_id: str, result: schemas.IntakeDateResult
+    db: Session, scan_id: str, result: schemas.IntakeDateResult, store_ids: Optional[list[str]] = None
 ) -> Optional[models.IntakeScan]:
     """
     Attach the OCR date scanner's reading to an open scan.
@@ -331,7 +483,7 @@ def apply_intake_date(
     about. Nothing here changes the scan's status: an OCR read is a
     proposal, and the scan stays pending until a person acts on it.
     """
-    db_scan = db.get(models.IntakeScan, scan_id)
+    db_scan = get_scan(db, scan_id, store_ids)
     if not db_scan or db_scan.status != models.ScanStatus.PENDING:
         return None
 
@@ -345,18 +497,25 @@ def apply_intake_date(
 
 
 def list_intake_scans(
-    db: Session, status: Optional[models.ScanStatus] = None, limit: int = 100
+    db: Session,
+    status: Optional[models.ScanStatus] = None,
+    limit: int = 100,
+    store_ids: Optional[list[str]] = None,
 ):
     """Pending queue is oldest-first: the unit waiting longest is the one
     blocking the dock."""
-    q = db.query(models.IntakeScan)
+    q = _in_scope(db.query(models.IntakeScan), models.IntakeScan, store_ids)
     if status:
         q = q.filter(models.IntakeScan.status == status)
     return q.order_by(models.IntakeScan.created_at.asc()).limit(limit).all()
 
 
 def confirm_intake_scan(
-    db: Session, scan_id: str, payload: schemas.IntakeConfirm, user_id: str
+    db: Session,
+    scan_id: str,
+    payload: schemas.IntakeConfirm,
+    user_id: str,
+    store_ids: Optional[list[str]] = None,
 ) -> Optional[tuple[models.IntakeScan, list[models.Item]]]:
     """
     The manual confirmation step: a pending scan becomes real inventory.
@@ -375,7 +534,7 @@ def confirm_intake_scan(
     includes the double-submit case, so a second press of Confirm cannot
     produce a second set of items.
     """
-    db_scan = db.get(models.IntakeScan, scan_id)
+    db_scan = get_scan(db, scan_id, store_ids)
     if not db_scan or db_scan.status != models.ScanStatus.PENDING:
         return None
 
@@ -407,6 +566,8 @@ def confirm_intake_scan(
     quantity = payload.quantity or db_scan.quantity or 1
     batch_id = payload.batch_id or db_scan.batch_id or f"INTAKE-{db_scan.id[:8]}"
     shelf_id = payload.shelf_id or db_scan.shelf_id
+    if shelf_id and not shelf_in_store(db, shelf_id, db_scan.store_id):
+        raise ValueError("That shelf is not one of your store's shelves.")
     now = datetime.utcnow()
 
     rules = expiration.load_rules(db)
@@ -428,6 +589,7 @@ def confirm_intake_scan(
             ),
             arrival_date=now,
             shelf_id=shelf_id,
+            store_id=db_scan.store_id,
             status=models.ItemStatus.IN_STOCK,
             ocr_raw_text=db_scan.ocr_raw_text,
             ocr_confidence=db_scan.ocr_confidence,
@@ -462,7 +624,7 @@ def confirm_intake_scan(
 
 
 def reject_intake_scan(
-    db: Session, scan_id: str, notes: Optional[str], user_id: str
+    db: Session, scan_id: str, notes: Optional[str], user_id: str, store_ids: Optional[list[str]] = None
 ) -> Optional[models.IntakeScan]:
     """
     Throw a scan away without creating an item.
@@ -471,7 +633,7 @@ def reject_intake_scan(
     a unit is not fit to donate, the software's job is to get out of the
     way and record it, not to interview them about it.
     """
-    db_scan = db.get(models.IntakeScan, scan_id)
+    db_scan = get_scan(db, scan_id, store_ids)
     if not db_scan or db_scan.status != models.ScanStatus.PENDING:
         return None
 
@@ -575,10 +737,14 @@ def create_reservation(
     Returns (reservation, outcome). Outcomes: "ok", "unavailable" (lost the
     race or never eligible), "past_discard" (see below).
     """
+    # Only food from an active store can be claimed. A deactivated store's
+    # stock stays on its own records but leaves the pantry pool at once.
+    active_store_ids = select(models.Store.id).where(models.Store.active == True)  # noqa: E712
     claimed = (
         db.query(models.Item)
         .filter(models.Item.id == res.item_id)
         .filter(models.Item.status == models.ItemStatus.AVAILABLE)
+        .filter(models.Item.store_id.in_(active_store_ids))
         .update(
             {models.Item.status: models.ItemStatus.RESERVED},
             synchronize_session=False,
@@ -617,14 +783,21 @@ def list_reservations(
     db: Session,
     pantry_id: Optional[str] = None,
     status: Optional[models.ReservationStatus] = None,
+    store_ids: Optional[list[str]] = None,
 ):
     """Newest first. `pantry_id` scopes the result to one organization —
-    the organizer dashboard always passes it, staff never do (FR-2.4)."""
+    the organizer dashboard always passes it, staff never do (FR-2.4).
+    `store_ids` scopes the store-side view to reservations of that store's
+    food (the item's store, since a reservation has none of its own)."""
     q = db.query(models.Reservation)
     if pantry_id:
         q = q.filter(models.Reservation.pantry_id == pantry_id)
     if status:
         q = q.filter(models.Reservation.status == status)
+    if store_ids is not None:
+        q = q.join(models.Item, models.Reservation.item_id == models.Item.id).filter(
+            models.Item.store_id.in_(store_ids)
+        )
     return q.order_by(models.Reservation.reserved_at.desc()).all()
 
 
@@ -681,7 +854,7 @@ def expire_stale_reservations(db: Session):
 
 
 def confirm_pickup(
-    db: Session, qr_code: str, confirmed_by_user_id: str
+    db: Session, qr_code: str, confirmed_by_user_id: str, store_ids: Optional[list[str]] = None
 ) -> tuple[Optional[models.Reservation], str]:
     """
     Redeems a pickup token at the shelf. Returns (reservation, outcome);
@@ -705,6 +878,12 @@ def confirm_pickup(
     """
     db_res = db.query(models.Reservation).filter(models.Reservation.qr_code == qr_code).first()
     if not db_res:
+        return None, "not_found"
+
+    # A code for another store's food reads exactly like an unknown code.
+    # Saying "that belongs to another store" would confirm it exists (FR-2.4).
+    res_item = db.get(models.Item, db_res.item_id)
+    if store_ids is not None and (res_item is None or res_item.store_id not in store_ids):
         return None, "not_found"
 
     if db_res.status == models.ReservationStatus.PICKED_UP:
@@ -743,6 +922,7 @@ def confirm_pickup(
         unit_value_at_handoff=item.unit_value if item else None,
         pantry_id=db_res.pantry_id,
         pantry_name_at_handoff=pantry.org_name if pantry else "",
+        store_id=item.store_id if item else None,
         confirmed_by_user_id=confirmed_by_user_id,
         confirmed_at=db_res.picked_up_at,
     ))
@@ -759,10 +939,11 @@ def list_donation_records(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     pantry_id: Optional[str] = None,
+    store_ids: Optional[list[str]] = None,
 ):
     """The donation history a business pulls at tax time. Newest first, so
     the most recent filing period is what shows up without scrolling."""
-    q = db.query(models.DonationRecord)
+    q = _in_scope(db.query(models.DonationRecord), models.DonationRecord, store_ids)
     if date_from:
         q = q.filter(models.DonationRecord.confirmed_at >= date_from)
     if date_to:
@@ -777,6 +958,7 @@ def summarize_donations_by_year(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     pantry_id: Optional[str] = None,
+    store_ids: Optional[list[str]] = None,
 ) -> list[dict]:
     """Tax-year totals (FR-11.8): one row per calendar year of confirmed_at,
     the number an accountant asks for. Takes the same filters as
@@ -786,7 +968,9 @@ def summarize_donations_by_year(
     recomputing per request is cheap and this stays identical on SQLite
     (tests) and Postgres (prod) without a dialect-specific date function.
     """
-    records = list_donation_records(db, date_from=date_from, date_to=date_to, pantry_id=pantry_id)
+    records = list_donation_records(
+        db, date_from=date_from, date_to=date_to, pantry_id=pantry_id, store_ids=store_ids
+    )
     by_year: dict[int, dict] = {}
     for r in records:
         bucket = by_year.setdefault(

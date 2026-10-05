@@ -86,8 +86,10 @@ def all_reservations(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_role(*auth.ALL_STORE_ROLES)),
 ):
-    """Store-side view of every reservation, across all organizations."""
-    return [_detail(r) for r in crud.list_reservations(db, status=status)]
+    """Store-side view of reservations across all organizations, limited to
+    the caller's own stores' food."""
+    store_ids = auth.visible_store_ids(db, user)
+    return [_detail(r) for r in crud.list_reservations(db, status=status, store_ids=store_ids)]
 
 
 @router.post("/{reservation_id}/cancel", response_model=schemas.ReservationDetailOut)
@@ -140,7 +142,9 @@ def confirm_pickup(
     the problem is the wrong code, a second scan, or an organization that
     arrived too late.
     """
-    reservation, outcome = crud.confirm_pickup(db, qr_code, confirmed_by_user_id=user.id)
+    reservation, outcome = crud.confirm_pickup(
+        db, qr_code, confirmed_by_user_id=user.id, store_ids=auth.visible_store_ids(db, user)
+    )
 
     if outcome == "not_found":
         raise HTTPException(status_code=404, detail="That code doesn't match any reservation.")

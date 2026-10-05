@@ -48,7 +48,29 @@ NEW_COLUMNS = {
     "products": {
         "unit_value": {"postgresql": "NUMERIC(10,2)", "sqlite": "NUMERIC(10,2)"},
     },
+    # Multi-store (NFR-4.6.1). The stores and brands tables are new, so
+    # create_all makes them; these are the columns that point at them.
+    "users": {
+        "store_id": {"postgresql": "UUID REFERENCES stores(id)", "sqlite": "CHAR(32) REFERENCES stores(id)"},
+        "brand_id": {"postgresql": "UUID REFERENCES brands(id)", "sqlite": "CHAR(32) REFERENCES brands(id)"},
+    },
+    "shelves": {
+        "store_id": {"postgresql": "UUID REFERENCES stores(id)", "sqlite": "CHAR(32) REFERENCES stores(id)"},
+    },
+    "items": {
+        "store_id": {"postgresql": "UUID REFERENCES stores(id)", "sqlite": "CHAR(32) REFERENCES stores(id)"},
+    },
+    "intake_scans": {
+        "store_id": {"postgresql": "UUID REFERENCES stores(id)", "sqlite": "CHAR(32) REFERENCES stores(id)"},
+    },
+    "donation_records": {
+        "store_id": {"postgresql": "UUID REFERENCES stores(id)", "sqlite": "CHAR(32) REFERENCES stores(id)"},
+    },
 }
+
+# Name of the store that existing, unassigned rows are moved into. Rename it
+# on the dashboard once that exists; until then the name is only a label.
+DEFAULT_STORE_NAME = "Default store"
 
 # Indexes the hot queries need (NFR-4.6.3). create_all adds these to new
 # tables; existing tables need them stated.
@@ -62,6 +84,11 @@ NEW_INDEXES = [
     ("ix_reservations_status", "reservations", "status"),
     ("ix_reservations_hold_expires_at", "reservations", "hold_expires_at"),
     ("ix_reservations_scheduled_pickup_at", "reservations", "scheduled_pickup_at"),
+    ("ix_users_store_id", "users", "store_id"),
+    ("ix_shelves_store_id", "shelves", "store_id"),
+    ("ix_items_store_id", "items", "store_id"),
+    ("ix_intake_scans_store_id", "intake_scans", "store_id"),
+    ("ix_donation_records_store_id", "donation_records", "store_id"),
 ]
 
 
@@ -200,6 +227,45 @@ def backfill_scheduled_pickup(db) -> int:
     return len(stale)
 
 
+def assign_unowned_rows_to_default_store(db) -> dict[str, int]:
+    """
+    Move rows that predate multi-store into one default store.
+
+    Before this change there was one implicit store, so every shelf, item,
+    scan and donation record belongs to it. Without this step those rows
+    have a NULL store_id and would be invisible to every store account, which
+    is the safe failure but would look like missing stock on the first day.
+
+    Only rows with no store are touched. A row that already has one keeps it,
+    and a second run finds nothing to move.
+    """
+    tables = {
+        "shelves": models.Shelf,
+        "items": models.Item,
+        "intake_scans": models.IntakeScan,
+        "donation_records": models.DonationRecord,
+    }
+    counts = {
+        name: db.query(model).filter(model.store_id.is_(None)).count()
+        for name, model in tables.items()
+    }
+    if not any(counts.values()):
+        return {}
+
+    store = db.query(models.Store).filter(models.Store.name == DEFAULT_STORE_NAME).first()
+    if store is None:
+        store = models.Store(name=DEFAULT_STORE_NAME, active=True)
+        db.add(store)
+        db.flush()
+
+    for model in tables.values():
+        db.query(model).filter(model.store_id.is_(None)).update(
+            {model.store_id: store.id}, synchronize_session=False
+        )
+    db.commit()
+    return {name: n for name, n in counts.items() if n}
+
+
 def main() -> None:
     print(f"Database: {engine.dialect.name}")
 
@@ -235,6 +301,13 @@ def main() -> None:
         print("\nBackfilling scheduled pickup times on pending reservations:")
         scheduled = backfill_scheduled_pickup(db)
         print(f"  updated: {scheduled} reservation(s)")
+
+        print("\nAssigning rows with no store to the default store:")
+        moved = assign_unowned_rows_to_default_store(db)
+        if moved:
+            print(f"  moved into '{DEFAULT_STORE_NAME}': " + ", ".join(f"{k} {v}" for k, v in moved.items()))
+        else:
+            print("  (none — every row already belongs to a store)")
     finally:
         db.close()
 

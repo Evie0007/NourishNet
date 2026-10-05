@@ -8,11 +8,12 @@ import pytest
 
 from app import models
 
-from .conftest import iso_in
+from .conftest import default_store, iso_in
 
 
 def _valued_item(db, name="Canned Beans", sku="BEANS-1", unit_value=2.50):
     item = models.Item(
+        store_id=default_store(db).id,
         name=name,
         sku=sku,
         category="Pantry",

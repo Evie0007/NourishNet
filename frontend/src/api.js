@@ -147,6 +147,9 @@ export const api = {
   registerPantry: (data) => post("/pantries", data),
   listPantries: () => request("/pantries"),
 
+  // Stores with a location, for the pantry map (plan Phase 3).
+  pantryMap: () => request("/stores/map"),
+
   // ---- reservations ----
   // `scheduledPickupLocal` is the raw value out of an
   // <input type="datetime-local">. The hold is derived from it server-side

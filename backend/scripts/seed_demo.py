@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
-from app import expiration, models, schemas, upc as upc_lib
+from app import expiration, geocode, models, schemas, upc as upc_lib
 
 # Real, check-digit-valid barcodes so the intake scanner can be demonstrated
 # by typing one of these into the UPC field. They are ordinary retail codes;
@@ -56,6 +56,25 @@ ORG_EMAIL = os.getenv("DEMO_ORG_EMAIL", "nourishnet26+organizer@gmail.com")
 DEMO_ORG_NAME = "Second Harvest Demo Pantry"
 DEMO_ORG_EIN = "94-2960297"
 
+# The store the demo shelves and the demo staff account belong to. Every
+# store-side view is scoped to a store, so without this the staff login would
+# see an empty dashboard (NFR-4.6.1).
+DEMO_STORE_NAME = "Demo Market"
+DEMO_STORE_ADDRESS = "750 Curtner Ave, San Jose, CA 95125"
+
+# A second location of the same demo, so the pantry map has two markers to
+# choose between on presentation day.
+DEMO_STORE_EAST_NAME = "Demo Market East"
+DEMO_STORE_EAST_ADDRESS = "Valley Fair area, San Jose, CA 95128"
+
+# Approximate, for the demo only. Used when a store has no coordinates yet
+# and the geocoder is off. With GEOCODE_ENABLED=true the address is looked up
+# instead. Existing coordinates are never overwritten.
+DEMO_COORDS = {
+    DEMO_STORE_NAME: (37.3382, -121.8863),        # downtown San Jose
+    DEMO_STORE_EAST_NAME: (37.3230, -121.9466),   # near Valley Fair
+}
+
 
 def require_password(var: str) -> str:
     value = os.getenv(var)
@@ -70,7 +89,7 @@ def require_password(var: str) -> str:
     return value
 
 
-def upsert_user(db, *, email, password, role, full_name, pantry_id=None):
+def upsert_user(db, *, email, password, role, full_name, pantry_id=None, store_id=None):
     user = db.query(models.User).filter(models.User.email == email).first()
     if user is None:
         user = models.User(email=email)
@@ -83,6 +102,7 @@ def upsert_user(db, *, email, password, role, full_name, pantry_id=None):
     user.role = role
     user.full_name = full_name
     user.pantry_id = pantry_id
+    user.store_id = store_id
     user.is_active = True
     print(f"  {action}: {email}  ({role.value})")
     return user
@@ -141,6 +161,38 @@ def main():
         pantry.verified = True
         db.flush()
 
+        print("Store:")
+        store = db.query(models.Store).filter(models.Store.name == DEMO_STORE_NAME).first()
+        if store is None:
+            store = models.Store(name=DEMO_STORE_NAME, address=DEMO_STORE_ADDRESS, active=True)
+            db.add(store)
+            db.flush()
+            print(f"  created: {DEMO_STORE_NAME}")
+        else:
+            print(f"  updated: {DEMO_STORE_NAME}")
+
+        print("Second location:")
+        east = db.query(models.Store).filter(models.Store.name == DEMO_STORE_EAST_NAME).first()
+        if east is None:
+            east = models.Store(name=DEMO_STORE_EAST_NAME, address=DEMO_STORE_EAST_ADDRESS, active=True)
+            db.add(east)
+            db.flush()
+            print(f"  created: {DEMO_STORE_EAST_NAME}")
+        else:
+            print(f"  updated: {DEMO_STORE_EAST_NAME}")
+
+        print("Locations (for the pantry map):")
+        for named in (store, east):
+            if named.latitude is not None and named.longitude is not None:
+                print(f"  kept:    {named.name} already located")
+                continue
+            coords = geocode.geocode_address(named.address) or DEMO_COORDS.get(named.name)
+            if coords:
+                named.latitude, named.longitude = coords
+                print(f"  set:     {named.name}")
+            else:
+                print(f"  skipped: {named.name} has no coordinates")
+
         print("Users:")
         upsert_user(
             db,
@@ -148,6 +200,7 @@ def main():
             password=staff_password,
             role=models.UserRole.MANAGER,
             full_name="Demo Store Manager",
+            store_id=store.id,
         )
         upsert_user(
             db,
@@ -174,6 +227,7 @@ def main():
                 models.Shelf(name="Shelf D — Meat & Pantry", location="Aisle 5, back wall", camera_id="cam-d1"),
             ]
             for shelf in shelves:
+                shelf.store_id = store.id
                 db.add(shelf)
             db.flush()
             shelves[0].current_temperature_c = 3.4
@@ -246,6 +300,7 @@ def main():
                     date_label_type=models.DateLabelType.SELL_BY,
                     date_source=models.DateSource.MANUAL,
                     arrival_date=now - timedelta(days=2),
+                    store_id=store.id,
                 )
                 if item_status == models.ItemStatus.NEEDS_REVIEW:
                     # The two ways an item lands in review: confidence below
@@ -309,6 +364,7 @@ def main():
             milk = upc_lib.find_product(db, upc_lib.normalize("036000291452"))
             db.add(
                 models.IntakeScan(
+                    store_id=store.id,
                     upc=milk.upc,
                     product_id=milk.id,
                     shelf_id=shelves[0].id,
@@ -341,6 +397,34 @@ def main():
             print("  created: 1 intake scan waiting on confirmation")
         else:
             print("Sample inventory: skipped (shelves already exist)")
+
+        # The second location's food. Only added while that location has none,
+        # so a re-run does not keep piling stock onto it.
+        if db.query(models.Item).filter(models.Item.store_id == east.id).count() == 0:
+            print("Second location's shelf and stock:")
+            east_shelf = models.Shelf(store_id=east.id, name="Shelf E — Produce", location="Front of store")
+            db.add(east_shelf)
+            db.flush()
+            east_now = datetime.utcnow()
+            for name, category, hours in [
+                ("Strawberries 1lb", "Produce", 30),
+                ("Bananas Bunch", "Produce", 20),
+                ("Greek Yogurt 6-pack", "Dairy", 40),
+            ]:
+                east_item = models.Item(
+                    store_id=east.id,
+                    shelf_id=east_shelf.id,
+                    name=name,
+                    category=category,
+                    status=models.ItemStatus.AVAILABLE,
+                    sell_by_date=east_now + timedelta(hours=hours),
+                    date_label_type=models.DateLabelType.SELL_BY,
+                    date_source=models.DateSource.MANUAL,
+                    arrival_date=east_now - timedelta(days=1),
+                )
+                expiration.apply_rules_to_item(db, east_item)
+                db.add(east_item)
+            print("  created: 1 shelf, 3 available items")
 
         db.commit()
         print("\nDone. Sign in at the login page with:")

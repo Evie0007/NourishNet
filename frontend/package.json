@@ -12,9 +12,11 @@
   },
   "dependencies": {
     "@zxing/browser": "^0.1.5",
+    "leaflet": "^1.9.4",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0",
     "react-router-dom": "^7.18.3"
   },
   "devDependencies": {

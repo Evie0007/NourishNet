@@ -13,7 +13,13 @@ def add_shelf(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_staff),
 ):
-    return crud.create_shelf(db, shelf)
+    """
+    Adds a shelf to the caller's store. The store is resolved from the
+    account, not the body: a brand account names its location, a store
+    account cannot name another store (auth.resolve_write_store).
+    """
+    store_id = auth.resolve_write_store(db, user, shelf.store_id)
+    return crud.create_shelf(db, shelf, store_id)
 
 
 @router.get("", response_model=list[schemas.ShelfOut])
@@ -21,7 +27,7 @@ def query_shelves(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.require_role(*auth.ALL_STORE_ROLES)),
 ):
-    return crud.list_shelves(db)
+    return crud.list_shelves(db, store_ids=auth.visible_store_ids(db, user))
 
 
 @router.patch("/{shelf_id}/reading", response_model=schemas.ShelfOut)
@@ -37,7 +43,7 @@ def update_reading(
     FR-1.11 wants the bridge on its own service credential rather than a
     human staff token. Until that exists, a staff token is what it uses.
     """
-    shelf = crud.update_shelf_reading(db, shelf_id, reading)
+    shelf = crud.update_shelf_reading(db, shelf_id, reading, store_ids=auth.visible_store_ids(db, user))
     if not shelf:
         raise HTTPException(status_code=404, detail="Shelf not found")
     return shelf

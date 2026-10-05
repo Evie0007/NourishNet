@@ -25,6 +25,10 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_DIR}/test.db"
 # expires it, which a background sweep would do first.
 os.environ["SWEEP_ENABLED"] = "false"
 
+# Tests must never reach a geocoding service. Individual tests opt in by
+# monkeypatching geocode.geocode_address.
+os.environ["GEOCODE_ENABLED"] = "false"
+
 # Without this, auth.py generates an ephemeral secret and warns.
 os.environ.setdefault("JWT_SECRET", "test-secret-not-used-anywhere-real")
 
@@ -63,13 +67,27 @@ def client():
     return TestClient(app)
 
 
-def _make_user(db, email, role, pantry=None):
+def default_store(db, name="Test Market"):
+    """Get-or-create one store, so helpers that build items directly and
+    fixtures that build staff accounts land in the same place."""
+    store = db.query(models.Store).filter(models.Store.name == name).first()
+    if store is None:
+        store = models.Store(name=name, address="1 Main St", active=True)
+        db.add(store)
+        db.commit()
+        db.refresh(store)
+    return store
+
+
+def _make_user(db, email, role, pantry=None, store=None, brand=None):
     user = models.User(
         email=email,
         password_hash=auth.hash_password("test-password"),
         full_name=email.split("@")[0],
         role=role,
         pantry_id=pantry.id if pantry else None,
+        store_id=store.id if store else None,
+        brand_id=brand.id if brand else None,
     )
     db.add(user)
     db.commit()
@@ -101,13 +119,28 @@ def verified_pantry(db):
 
 
 @pytest.fixture
-def staff_headers(db):
-    return _bearer(_make_user(db, "staff@example.com", models.UserRole.STAFF))
+def store(db):
+    return default_store(db)
 
 
 @pytest.fixture
-def manager_headers(db):
-    return _bearer(_make_user(db, "manager@example.com", models.UserRole.MANAGER))
+def staff_headers(db, store):
+    return _bearer(_make_user(db, "staff@example.com", models.UserRole.STAFF, store=store))
+
+
+@pytest.fixture
+def manager_headers(db, store):
+    return _bearer(_make_user(db, "manager@example.com", models.UserRole.MANAGER, store=store))
+
+
+@pytest.fixture
+def other_store(db):
+    return default_store(db, name="Other Market")
+
+
+@pytest.fixture
+def other_store_staff_headers(db, other_store):
+    return _bearer(_make_user(db, "othstaff@example.com", models.UserRole.STAFF, store=other_store))
 
 
 @pytest.fixture
@@ -135,11 +168,12 @@ def other_organizer_headers(db):
 
 
 @pytest.fixture
-def available_item(db):
+def available_item(db, store):
     """An AVAILABLE item with a discard deadline comfortably past the 24h
     booking horizon, so it does not accidentally constrain tests that are
     about something else."""
     item = models.Item(
+        store_id=store.id,
         name="Test Milk 2L",
         category="Dairy",
         status=models.ItemStatus.AVAILABLE,
