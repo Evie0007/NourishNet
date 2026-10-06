@@ -96,10 +96,10 @@ export default function RipenessCheck() {
   }
 
   return (
-    <Card title="Banana freshness check">
+    <Card title="Fruit freshness check">
       <p className="mb-3 text-sm text-gray-600">
-        Hold a banana in front of the camera against a plain background, in even light. The
-        estimate comes from peel colour only — it helps decide what to donate first, and the
+        Hold a piece of fruit in front of the camera against a plain background, in even light.
+        The estimate comes from skin colour only — it helps decide what to donate first, and the
         printed date still governs.
       </p>
 
@@ -123,7 +123,7 @@ export default function RipenessCheck() {
           />
           <div className="flex gap-2">
             <button onClick={capture} className={primary}>
-              Check banana
+              Check fruit
             </button>
             <button onClick={closeCamera} className={secondary}>
               Stop camera

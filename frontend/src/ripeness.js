@@ -99,7 +99,7 @@ export function analyzeRipeness({ data, width, height }) {
     return {
       found: false,
       reason:
-        "No banana found in the frame. Put it on a plain background, fill more of the picture, and use even light.",
+        "No fruit found in the frame. Put it on a plain background, fill more of the picture, and use even light.",
     };
   }
 
