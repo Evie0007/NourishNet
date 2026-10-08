@@ -158,17 +158,14 @@ export const api = {
   setStoreOpen: (storeId, openForPickup) =>
     patch(`/stores/${storeId}/availability`, { open_for_pickup: openForPickup }),
 
-  // ---- reservations ----
-  // `scheduledPickupLocal` is the raw value out of an
-  // <input type="datetime-local">. The hold is derived from it server-side
-  // (slot + 30 minutes), so there is no hold length to pass.
-  createReservation: (itemId, scheduledPickupLocal) =>
-    post("/reservations", {
-      item_id: itemId,
-      scheduled_pickup_at: toUtcIso(scheduledPickupLocal),
-    }),
-  // Several items, one trip, one QR code. All or nothing: if any item is no
-  // longer available the server reserves none and names the one that failed.
+  // ---- orders and reservations ----
+  // Every pickup the portal makes is an order: several items, one trip, one
+  // QR code. All or nothing: if any item is no longer available the server
+  // reserves none and names the one that failed. `scheduledPickupLocal` is the
+  // raw value out of an <input type="datetime-local">; the hold is derived
+  // from it server-side (slot + 30 minutes), so there is no hold length to
+  // pass. (POST /reservations, for a single item, still exists on the API but
+  // the portal no longer uses it.)
   createOrder: (itemIds, scheduledPickupLocal) =>
     post("/reservations/orders", {
       item_ids: itemIds,

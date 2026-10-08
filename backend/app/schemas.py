@@ -551,9 +551,10 @@ class ReservationCreate(_ScheduledPickup):
     item_id: str
 
 
-# More than this in one trip is a warehouse run, not a shelf pickup, and a
-# long list makes one slow request that claims many rows at once.
-MAX_ORDER_ITEMS = 20
+# Items are one row per unit, so a quantity of 50 is 50 ids. This has to leave
+# room for a pantry taking a large quantity of one thing, while still stopping
+# a request that claims thousands of rows at once.
+MAX_ORDER_ITEMS = 200
 
 
 class PickupOrderCreate(_ScheduledPickup):

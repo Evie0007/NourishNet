@@ -4,6 +4,7 @@ import { api, parseUtc, toLocalInputValue } from "../api";
 import { useAuth } from "../auth";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
 import ShelfFinder from "../components/ShelfFinder";
+import { groupItems, orderNumber, tallyItems } from "../orders";
 
 // Mirrors schemas.SCHEDULE_HORIZON and PICKUP_GRACE on the backend. The
 // server is authoritative — these only shape the control so it cannot
@@ -39,12 +40,10 @@ export default function OrganizerDashboard() {
   const zipRef = useRef("");
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
-  // Which row has its pickup-time picker open. One at a time — a list of
-  // half-filled forms is worse than a single focused one.
-  const [schedulingId, setSchedulingId] = useState(null);
-  // Items added to the pickup in progress. Held here rather than on the
-  // server: nothing is claimed until the organization confirms a time, so
-  // browsing with a full basket takes nothing off anyone else.
+  // The order in progress: [{ key, qty }], one line per group of identical
+  // units (see groupItems). Held here rather than on the server: nothing is
+  // claimed until the organization confirms a time, so browsing with a full
+  // basket takes nothing off anyone else.
   const [basket, setBasket] = useState([]);
   const [basketNotice, setBasketNotice] = useState("");
 
@@ -101,26 +100,48 @@ export default function OrganizerDashboard() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Someone else may claim an item while it sits in the basket. Drop it and
-  // say so, rather than letting the whole order fail on it later.
+  // Everything on offer, as groups of identical units, and by key so a basket
+  // line can find its group.
+  const allGroups = useMemo(() => groupItems(available), [available]);
+  const groupByKey = useMemo(() => new Map(allGroups.map((g) => [g.key, g])), [allGroups]);
+
+  // Someone else may claim units while they sit in the basket. Trim the line
+  // (or drop it) and say so, rather than letting the whole order fail later.
   useEffect(() => {
-    const gone = basket.filter((b) => !available.some((i) => i.id === b.id));
-    if (gone.length === 0) return;
-    setBasket(basket.filter((b) => available.some((i) => i.id === b.id)));
+    if (basket.length === 0) return;
+    let lost = 0;
+    const next = [];
+    for (const line of basket) {
+      const group = groupByKey.get(line.key);
+      const qty = group ? Math.min(line.qty, group.items.length) : 0;
+      lost += line.qty - qty;
+      if (qty > 0) next.push({ key: line.key, qty });
+    }
+    if (lost === 0) return;
+    setBasket(next);
     setBasketNotice(
-      gone.length === 1
-        ? `“${gone[0].name}” was taken or is no longer available, so it was removed from your pickup.`
-        : `${gone.length} items were taken or are no longer available, so they were removed from your pickup.`,
+      `${lost} ${lost === 1 ? "item was" : "items were"} taken or no longer available, so ${
+        lost === 1 ? "it was" : "they were"
+      } removed from your order.`,
     );
     // Only when the donation list changes — not on every basket edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [available]);
+  }, [groupByKey]);
+
+  // The basket with its groups attached, for display and for placing the order.
+  const lines = useMemo(
+    () =>
+      basket
+        .map((line) => ({ ...line, group: groupByKey.get(line.key) }))
+        .filter((line) => line.group),
+    [basket, groupByKey],
+  );
 
   const storeNames = useMemo(
     () => Object.fromEntries(locations.map((s) => [s.id, s.name])),
     [locations],
   );
-  const basketStoreId = basket[0]?.store_id ?? null;
+  const basketStoreId = lines[0]?.group.store_id ?? null;
 
   const categories = useMemo(
     () => [...new Set(available.map((i) => i.category).filter(Boolean))].sort(),
@@ -129,10 +150,10 @@ export default function OrganizerDashboard() {
 
   // FR-8.3
   const visible = useMemo(() => {
-    const rows = available.filter(
-      (i) =>
-        (!category || i.category === category) &&
-        (!selectedStoreId || i.store_id === selectedStoreId),
+    const rows = allGroups.filter(
+      (g) =>
+        (!category || g.category === category) &&
+        (!selectedStoreId || g.store_id === selectedStoreId),
     );
     return [...rows].sort((a, b) =>
       sortBy === "name"
@@ -140,7 +161,7 @@ export default function OrganizerDashboard() {
         : (parseUtc(a.sell_by_date)?.getTime() ?? Infinity) -
           (parseUtc(b.sell_by_date)?.getTime() ?? Infinity),
     );
-  }, [available, category, selectedStoreId, sortBy]);
+  }, [allGroups, category, selectedStoreId, sortBy]);
 
   // Soonest pickup first — the API orders by when the reservation was
   // made, which is not the order anyone collects in.
@@ -157,43 +178,36 @@ export default function OrganizerDashboard() {
   // their one QR code; a lone reservation is its own card.
   const pickups = groupPickups(active);
 
-  async function reserve(itemId, scheduledLocal) {
-    setError("");
-    try {
-      await api.createReservation(itemId, scheduledLocal);
-      setSchedulingId(null);
-      await refresh();
-    } catch (err) {
-      setError(err.message);
-    }
-  }
-
-  function toggleInBasket(item) {
+  // Set how many units of a group are in the order. 0 removes the line.
+  function setQuantity(group, qty) {
     setError("");
     setBasketNotice("");
-    if (basket.some((b) => b.id === item.id)) {
-      setBasket(basket.filter((b) => b.id !== item.id));
+    const clamped = Math.max(0, Math.min(qty, group.items.length));
+    if (clamped === 0) {
+      setBasket(basket.filter((b) => b.key !== group.key));
       return;
     }
     // One trip goes to one shelf. Say which, so the fix is obvious.
-    if (basket.length > 0 && item.store_id !== basketStoreId) {
+    if (lines.length > 0 && group.store_id !== basketStoreId && !basket.some((b) => b.key === group.key)) {
       setError(
-        `Your pickup is at ${storeNames[basketStoreId] || "another shelf"}, and a pickup covers one ` +
-          `location. Reserve or clear it first to add items from ${storeNames[item.store_id] || "this shelf"}.`,
+        `Your order is at ${storeNames[basketStoreId] || "another shelf"}, and an order covers one ` +
+          `location. Place or clear it first to add items from ${storeNames[group.store_id] || "this shelf"}.`,
       );
       return;
     }
-    setSchedulingId(null);
-    setBasket([...basket, item]);
+    setBasket(
+      basket.some((b) => b.key === group.key)
+        ? basket.map((b) => (b.key === group.key ? { ...b, qty: clamped } : b))
+        : [...basket, { key: group.key, qty: clamped }],
+    );
   }
 
   async function placeOrder(scheduledLocal) {
     setError("");
     try {
-      await api.createOrder(
-        basket.map((b) => b.id),
-        scheduledLocal,
-      );
+      // Each line asks for N of a group; the order is the first N real units.
+      const itemIds = lines.flatMap((line) => line.group.items.slice(0, line.qty).map((i) => i.id));
+      await api.createOrder(itemIds, scheduledLocal);
       setBasket([]);
       setBasketNotice("");
       await refresh();
@@ -220,7 +234,7 @@ export default function OrganizerDashboard() {
   return (
     <Shell
       title={user?.pantry_name || "Donation portal"}
-      subtitle="Browse what's available, reserve what you can collect, and show the code at the shelf."
+      subtitle="Browse what's available, add it to an order, and show the order's code at the shelf."
     >
       <ErrorBanner message={error} onDismiss={() => setError("")} />
 
@@ -300,73 +314,58 @@ export default function OrganizerDashboard() {
               {visible.length === 0 ? (
                 <Empty>Nothing available right now. Check back later today.</Empty>
               ) : (
-                <ul className="divide-y divide-gray-100">
-                  {visible.map((item) => (
-                    <li key={item.id} className="py-3">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        {/* FR-8.2 */}
-                        <div className="min-w-0">
-                          <div className="font-medium">{item.name}</div>
-                          <div className="mt-0.5 text-xs text-gray-500">
-                            {storeNames[item.store_id] ? `${storeNames[item.store_id]} · ` : ""}
-                            {item.category || "Uncategorized"} · sell-by{" "}
-                            {formatDate(item.sell_by_date)}
-                          </div>
-                        </div>
-                        <div className="flex gap-2">
-                          {/* Several items, one trip, one QR code (FR-8.13). */}
-                          <button
-                            onClick={() => toggleInBasket(item)}
-                            disabled={!verified}
-                            aria-pressed={basket.some((b) => b.id === item.id)}
-                            title={
-                              verified ? undefined : "Available once your organization is verified"
-                            }
-                            className={`rounded-lg border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-400 ${
-                              basket.some((b) => b.id === item.id)
-                                ? "border-emerald-600 bg-emerald-50 text-emerald-800"
-                                : "border-emerald-600 text-emerald-700 hover:bg-emerald-50"
-                            }`}
-                          >
-                            {basket.some((b) => b.id === item.id) ? "✓ In pickup" : "Add to pickup"}
-                          </button>
-                          <button
-                            onClick={() =>
-                              setSchedulingId(schedulingId === item.id ? null : item.id)
-                            }
-                            disabled={!verified}
-                            aria-expanded={schedulingId === item.id}
-                            title={
-                              verified ? undefined : "Available once your organization is verified"
-                            }
-                            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-                          >
-                            {schedulingId === item.id ? "Close" : "Reserve now"}
-                          </button>
-                        </div>
-                      </div>
-
-                      {schedulingId === item.id && (
-                        <SchedulePicker
-                          item={item}
-                          onCancel={() => setSchedulingId(null)}
-                          onConfirm={(scheduledLocal) => reserve(item.id, scheduledLocal)}
-                        />
-                      )}
-                    </li>
-                  ))}
-                </ul>
+                // FR-8.2. Name with its type, sell-by, and quantity each get a
+                // column, so a large quantity reads as a number rather than a
+                // long list of identical rows.
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-100 text-left text-xs text-gray-500">
+                        <th className="pb-2 pr-4 font-medium">Item</th>
+                        <th className="pb-2 pr-4 font-medium">Sell-by</th>
+                        <th className="pb-2 pr-4 text-right font-medium">Quantity</th>
+                        <th className="pb-2">
+                          <span className="sr-only">Add to pickup</span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {visible.map((group) => (
+                        <tr key={group.key}>
+                          <td className="py-3 pr-4">
+                            <div className="font-medium">{group.name}</div>
+                            <div className="mt-0.5 text-xs text-gray-500">
+                              {group.category || "Uncategorized"}
+                            </div>
+                          </td>
+                          <td className="whitespace-nowrap py-3 pr-4 text-gray-700">
+                            {formatDate(group.sell_by_date)}
+                          </td>
+                          <td className="py-3 pr-4 text-right tabular-nums">{group.items.length}</td>
+                          <td className="py-3 text-right">
+                            <AddToOrder
+                              group={group}
+                              qty={basket.find((b) => b.key === group.key)?.qty ?? 0}
+                              onChange={(qty) => setQuantity(group, qty)}
+                              verified={verified}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </Card>
           </div>
 
           <div className="space-y-6 lg:col-span-2">
-            {(basket.length > 0 || basketNotice) && (
+            {(lines.length > 0 || basketNotice) && (
               <PickupBasket
-                basket={basket}
+                lines={lines}
                 storeName={storeNames[basketStoreId]}
                 notice={basketNotice}
-                onRemove={toggleInBasket}
+                onChange={(line, qty) => setQuantity(line.group, qty)}
                 onClear={() => {
                   setBasket([]);
                   setBasketNotice("");
@@ -375,9 +374,9 @@ export default function OrganizerDashboard() {
               />
             )}
 
-            <Card title={`Your pickups (${pickups.length})`}>
+            <Card title={`Your orders (${pickups.length})`}>
               {pickups.length === 0 ? (
-                <Empty>No active reservations.</Empty>
+                <Empty>No active orders. Add items to an order to get a pickup code.</Empty>
               ) : (
                 <div className="space-y-4">
                   {pickups.map((group) => (
@@ -392,20 +391,8 @@ export default function OrganizerDashboard() {
             </Card>
 
             {past.length > 0 && (
-              <Card title="History">
-                <ul className="divide-y divide-gray-100">
-                  {past.map((r) => (
-                    <li key={r.id} className="flex items-center justify-between gap-3 py-2 text-sm">
-                      <div className="min-w-0">
-                        <div className="truncate font-medium">{r.item_name}</div>
-                        <div className="text-xs text-gray-500">
-                          {formatDateTime(r.picked_up_at || r.hold_expires_at)}
-                        </div>
-                      </div>
-                      <StatusBadge status={r.status} />
-                    </li>
-                  ))}
-                </ul>
+              <Card title="Order history">
+                <OrderHistory reservations={past} />
               </Card>
             )}
           </div>
@@ -428,13 +415,18 @@ function SchedulePicker({
   onConfirm,
   onCancel,
   prompt = "When will you collect this?",
-  confirmLabel = "Confirm reservation",
+  confirmLabel = "Place order",
   subject = "This item",
 }) {
   const [value, setValue] = useState(() => toLocalInputValue(defaultSlot()));
   const [problem, setProblem] = useState("");
 
-  const min = useMemo(() => toLocalInputValue(new Date()), []);
+  // Rounded up to a 5-minute mark, not "now". The control steps in 5 minutes
+  // counting from its minimum, so a minimum of 10:24 makes 10:30 an invalid
+  // value and the browser refuses the default slot with "the nearest valid
+  // values are 10:29 and 10:34" — but only on minutes that are not multiples
+  // of 5, which is what made it look intermittent.
+  const min = useMemo(() => toLocalInputValue(nextFiveMinutes()), []);
 
   // The far edge is 24 hours out, or the moment the food has to leave the
   // shelf, whichever comes first. Without the second bound an overnight
@@ -515,6 +507,13 @@ function SchedulePicker({
   );
 }
 
+/** Now, rounded up to the next 5-minute mark (a multiple of 5 minutes since the
+ *  epoch, which is a 5-minute mark on the clock in every real time zone). */
+function nextFiveMinutes() {
+  const step = 5 * 60_000;
+  return new Date(Math.ceil(Date.now() / step) * step);
+}
+
 /** The next half-hour boundary at least an hour out — the common case is
  *  "later today", and a sensible default makes that one tap. */
 function defaultSlot() {
@@ -525,26 +524,80 @@ function defaultSlot() {
 }
 
 /**
- * The pickup in progress: items added with "Add to pickup", waiting on a time.
- * Nothing is reserved until the time is confirmed, and then it is all of them
- * or none (FR-8.13).
+ * "Add to pickup" until something is in the order, then a quantity stepper:
+ * the same control in the list and in the order, like an online grocery order.
+ * Taking the quantity to zero removes the line. The most you can ask for is
+ * the number of identical units on the shelf.
  */
-function PickupBasket({ basket, storeName, notice, onRemove, onClear, onConfirm }) {
-  // The earliest-dated item decides how late the slot may be: a slot past any
-  // one item's discard time would be refused, so the picker bounds itself by it.
+function AddToOrder({ group, qty, onChange, verified }) {
+  const max = group.items.length;
+
+  if (qty === 0) {
+    return (
+      <button
+        onClick={() => onChange(1)}
+        disabled={!verified}
+        title={verified ? undefined : "Available once your organization is verified"}
+        className="rounded-lg border border-emerald-600 px-3 py-1.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-400"
+      >
+        Add to pickup
+      </button>
+    );
+  }
+
+  return (
+    <div
+      role="group"
+      aria-label={`Quantity of ${group.name} in your order`}
+      className="inline-flex items-center overflow-hidden rounded-lg border border-emerald-600 bg-emerald-50 text-emerald-800"
+    >
+      <button
+        onClick={() => onChange(qty - 1)}
+        aria-label={`Remove one ${group.name}`}
+        className="px-3 py-1.5 text-sm font-medium hover:bg-emerald-100"
+      >
+        −
+      </button>
+      <span aria-live="polite" className="min-w-8 px-1 text-center text-sm font-medium tabular-nums">
+        {qty}
+      </span>
+      <button
+        onClick={() => onChange(qty + 1)}
+        disabled={qty >= max}
+        aria-label={`Add one more ${group.name}`}
+        title={qty >= max ? `Only ${max} available` : undefined}
+        className="px-3 py-1.5 text-sm font-medium hover:bg-emerald-100 disabled:cursor-not-allowed disabled:text-emerald-300 disabled:hover:bg-transparent"
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The order in progress: what has been added, waiting on a pickup time.
+ * Nothing is reserved until the order is placed, and then it is all of it or
+ * none (FR-8.13). `lines` is [{ key, qty, group }].
+ */
+function PickupBasket({ lines, storeName, notice, onChange, onClear, onConfirm }) {
+  const totalUnits = lines.reduce((sum, line) => sum + line.qty, 0);
+
+  // The earliest-dated unit decides how late the slot may be: a slot past any
+  // one item's discard time would be refused, so the picker bounds itself by
+  // the units actually chosen.
   const earliest = useMemo(() => {
-    const dated = basket
-      .map((b) => b.discard_after)
+    const dated = lines
+      .flatMap((line) => line.group.items.slice(0, line.qty).map((i) => i.discard_after))
       .filter(Boolean)
       .sort((a, b) => parseUtc(a) - parseUtc(b));
     return { id: "basket", discard_after: dated[0] ?? null };
-  }, [basket]);
+  }, [lines]);
 
   return (
     <Card
-      title={`Your pickup (${basket.length} item${basket.length === 1 ? "" : "s"})`}
+      title={`Your order (${totalUnits} item${totalUnits === 1 ? "" : "s"})`}
       action={
-        basket.length > 0 && (
+        lines.length > 0 && (
           <button
             onClick={onClear}
             className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
@@ -559,37 +612,36 @@ function PickupBasket({ basket, storeName, notice, onRemove, onClear, onConfirm 
           {notice}
         </p>
       )}
-      {basket.length > 0 && (
+      {lines.length > 0 && (
         <>
           {storeName && (
             <p className="mb-2 text-xs text-gray-500">
-              Collect all of these at <span className="font-medium text-gray-700">{storeName}</span>{" "}
+              Collect all of this at <span className="font-medium text-gray-700">{storeName}</span>{" "}
               with one QR code.
             </p>
           )}
           <ul className="divide-y divide-gray-100">
-            {basket.map((item) => (
-              <li key={item.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+            {lines.map((line) => (
+              <li key={line.key} className="flex items-center justify-between gap-3 py-2 text-sm">
                 <div className="min-w-0">
-                  <div className="truncate font-medium">{item.name}</div>
+                  <div className="truncate font-medium">{line.group.name}</div>
                   <div className="text-xs text-gray-500">
-                    {item.category || "Uncategorized"} · sell-by {formatDate(item.sell_by_date)}
+                    {line.group.category || "Uncategorized"} · sell-by {formatDate(line.group.sell_by_date)}
                   </div>
                 </div>
-                <button
-                  onClick={() => onRemove(item)}
-                  aria-label={`Remove ${item.name} from pickup`}
-                  className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
-                >
-                  Remove
-                </button>
+                <AddToOrder
+                  group={line.group}
+                  qty={line.qty}
+                  onChange={(qty) => onChange(line, qty)}
+                  verified
+                />
               </li>
             ))}
           </ul>
           <SchedulePicker
             item={earliest}
-            prompt="When will you collect these?"
-            confirmLabel={`Reserve ${basket.length} item${basket.length === 1 ? "" : "s"}`}
+            prompt="When will you collect this order?"
+            confirmLabel={`Place order · ${totalUnits} item${totalUnits === 1 ? "" : "s"}`}
             subject="The earliest-dated item"
             onConfirm={onConfirm}
           />
@@ -601,8 +653,8 @@ function PickupBasket({ basket, storeName, notice, onRemove, onClear, onConfirm 
 
 /**
  * Reservations that share an order are one trip with one QR code, so they are
- * shown as one card. A reservation with no order is its own group. The input
- * is already sorted soonest-first, and groups keep the order they first appear.
+ * shown as one group. A reservation with no order (made before orders
+ * existed) is its own group. Groups keep the order they first appear in.
  */
 function groupPickups(reservations) {
   const groups = new Map();
@@ -637,15 +689,17 @@ function PickupCard({ group, onCancel }) {
         <div className="min-w-0">
           {isOrder ? (
             <>
-              <div className="font-medium">
+              <div className="font-medium">Order #{orderNumber(reservation.order_id)}</div>
+              <div className="mt-0.5 text-xs text-gray-500">
+                {reservation.store_name ? `${reservation.store_name} · ` : ""}
                 {group.length} item{group.length === 1 ? "" : "s"}
-                {reservation.store_name ? ` · ${reservation.store_name}` : ""}
               </div>
-              <ul className="mt-1 space-y-0.5 text-sm text-gray-700">
-                {group.map((r) => (
-                  <li key={r.id}>
-                    {r.item_name}
-                    {r.item_category && <span className="text-xs text-gray-500"> · {r.item_category}</span>}
+              <ul className="mt-2 space-y-0.5 text-sm text-gray-700">
+                {tallyItems(group).map((line) => (
+                  <li key={`${line.name}|${line.category}`}>
+                    {line.name}
+                    {line.count > 1 && <span className="font-medium"> × {line.count}</span>}
+                    {line.category && <span className="text-xs text-gray-500"> · {line.category}</span>}
                   </li>
                 ))}
               </ul>
@@ -681,7 +735,7 @@ function PickupCard({ group, onCancel }) {
           <code className="select-all text-center text-xs tracking-wide text-gray-500">{code}</code>
           <p className="text-center text-xs text-gray-500">
             {isOrder
-              ? "One code for everything above. Show it to store staff at the shelf."
+              ? "One code for the whole order. Show it to store staff at the shelf."
               : "Show this to store staff at the shelf."}
           </p>
         </div>
@@ -701,9 +755,92 @@ function PickupCard({ group, onCancel }) {
         onClick={onCancel}
         className="mt-3 text-xs font-medium text-gray-500 underline hover:text-gray-800"
       >
-        {isOrder ? "Cancel whole pickup" : "Cancel reservation"}
+        {isOrder ? "Cancel order" : "Cancel reservation"}
       </button>
     </div>
+  );
+}
+
+// Past orders are a log, not a worklist: show the latest few and keep the
+// rest a click away, so a long history does not push everything else down.
+const HISTORY_ORDERS_SHOWN = 6;
+
+/**
+ * Past orders, one row each, however many items they held. An order's items
+ * are tucked under its row; a reservation from before orders existed is a
+ * plain row of its own. The order's status is read off its items: it counts
+ * as picked up if any item was collected.
+ */
+function OrderHistory({ reservations }) {
+  const [showAll, setShowAll] = useState(false);
+
+  const orders = useMemo(() => {
+    const when = (r) => parseUtc(r.picked_up_at || r.hold_expires_at)?.getTime() ?? 0;
+    return groupPickups(reservations)
+      .map((group) => ({ group, at: Math.max(...group.map(when)) }))
+      .sort((a, b) => b.at - a.at);
+  }, [reservations]);
+
+  const shown = showAll ? orders : orders.slice(0, HISTORY_ORDERS_SHOWN);
+
+  return (
+    <>
+      <ul className="divide-y divide-gray-100">
+        {shown.map(({ group, at }) => {
+          const first = group[0];
+          const isOrder = Boolean(first.order_id);
+          const status = group.some((r) => r.status === "picked_up")
+            ? "picked_up"
+            : group.some((r) => r.status === "expired")
+              ? "expired"
+              : "cancelled";
+          const summary = (
+            <>
+              <div className="min-w-0">
+                <div className="truncate font-medium">
+                  {isOrder ? `Order #${orderNumber(first.order_id)}` : first.item_name}
+                </div>
+                <div className="text-xs text-gray-500">
+                  {isOrder ? `${group.length} item${group.length === 1 ? "" : "s"} · ` : ""}
+                  {formatDateTime(new Date(at).toISOString())}
+                </div>
+              </div>
+              <StatusBadge status={status} />
+            </>
+          );
+          return isOrder ? (
+            <li key={first.order_id}>
+              <details className="group py-2 text-sm">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+                  {summary}
+                </summary>
+                <ul className="mt-2 space-y-0.5 pl-1 text-xs text-gray-600">
+                  {tallyItems(group).map((line) => (
+                    <li key={`${line.name}|${line.category}`}>
+                      {line.name}
+                      {line.count > 1 && <span className="font-medium"> × {line.count}</span>}
+                      {line.category && <span className="text-gray-400"> · {line.category}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </li>
+          ) : (
+            <li key={first.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+              {summary}
+            </li>
+          );
+        })}
+      </ul>
+      {orders.length > HISTORY_ORDERS_SHOWN && (
+        <button
+          onClick={() => setShowAll((all) => !all)}
+          className="mt-2 text-xs font-medium text-gray-500 underline hover:text-gray-800"
+        >
+          {showAll ? "Show fewer" : `Show all ${orders.length} orders`}
+        </button>
+      )}
+    </>
   );
 }
 
