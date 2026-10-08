@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, formatCurrency, parseUtc } from "../api";
 import { useAuth } from "../auth";
+import { describeItems, describeNames, orderNumber } from "../orders";
 import BarcodeScanner from "../components/BarcodeScanner";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
 import Intake from "./Intake";
@@ -362,8 +363,8 @@ function ScanOutcome({ outcome }) {
     <div className="mb-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
       Collected:{" "}
       <span className="font-medium">
-        {reservation.order_item_names?.length > 1
-          ? `${reservation.order_item_names.length} items (${reservation.order_item_names.join(", ")})`
+        {reservation.order_id
+          ? `Order #${orderNumber(reservation.order_id)} (${describeNames(reservation.order_item_names)})`
           : reservation.item_name}
       </span>{" "}
       by {reservation.pantry_name} at {formatTime(reservation.picked_up_at)}.
@@ -529,10 +530,10 @@ function ScheduleRow({ group }) {
           {overdue && <span className="ml-2 text-xs font-normal">· overdue</span>}
         </div>
         <div className="mt-0.5 truncate text-xs text-gray-500">
-          {group.length > 1
-            ? `${group.length} items (${group.map((r) => r.item_name).join(", ")})`
-            : reservation.item_name}{" "}
-          · {reservation.pantry_name}
+          {reservation.order_id && (
+            <span className="font-medium text-gray-700">Order #{orderNumber(reservation.order_id)} · </span>
+          )}
+          {describeItems(group)} · {reservation.pantry_name}
         </div>
       </div>
       <StatusBadge status={reservation.status} />

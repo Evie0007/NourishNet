@@ -43,7 +43,7 @@ Nothing runs from the repo root except git.
 |---|---|---|
 | `/` | Anyone | Welcome + sign in (one form, both roles). Also holds the pantry self-registration form. |
 | `/staff` | `staff`, `manager`, `admin` | Intake station, status counts, OCR review queue, near-expiry list, expiration rules, shelf conditions, inventory, QR pickup confirmation |
-| `/organizer` | `org_coordinator` | Map of shelf locations with a zip-code finder and per-shelf availability, available donations, reserve one item or **Add to pickup** for several items under one QR code, hold-window countdown, cancel |
+| `/organizer` | `org_coordinator` | Map of shelf locations with a zip-code finder and per-shelf availability, available donations, **Add to pickup** to build an order (with quantities) that gets its own order number and one QR code, order history, hold-window countdown, cancel |
 
 Sign-in routes each user to their own dashboard based on the role the server
 returns — never on which URL was typed.

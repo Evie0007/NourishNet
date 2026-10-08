@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app import models
+from app import models, schemas
 
 from .conftest import _bearer, _make_pantry, _make_user, default_store, iso_in
 
@@ -126,6 +126,29 @@ def test_an_order_needs_at_least_one_item(client, organizer_headers):
         headers=organizer_headers,
     )
     assert res.status_code == 422
+
+
+def test_a_large_quantity_fits_in_one_order(client, db, store, organizer_headers):
+    """Quantity is units, each its own row, so a big quantity is a long list
+    of ids. The cap has to leave room for a case or two."""
+    units = [_item(db, store, "Whole Milk, 1 gal") for _ in range(60)]
+
+    res = _order(client, organizer_headers, units)
+
+    assert res.status_code == 200, res.text
+    assert len(res.json()) == 60
+    assert _statuses(db, units) == [models.ItemStatus.RESERVED] * 60
+
+
+def test_an_order_is_capped_so_one_request_cannot_claim_everything(
+    client, db, store, organizer_headers
+):
+    too_many = [_item(db, store, "Whole Milk, 1 gal") for _ in range(schemas.MAX_ORDER_ITEMS + 1)]
+
+    res = _order(client, organizer_headers, too_many)
+
+    assert res.status_code == 422
+    assert _statuses(db, too_many) == [models.ItemStatus.AVAILABLE] * len(too_many)
 
 
 def test_the_same_item_twice_is_refused(client, organizer_headers, three_items):

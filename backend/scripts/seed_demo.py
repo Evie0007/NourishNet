@@ -97,28 +97,41 @@ DEMO_LOCATIONS = [
 ]
 DEMO_STORE_NAME = DEMO_LOCATIONS[0]["name"]
 
-# What the two other shelves hold: (name, category, hours until sell-by).
-# Everything is AVAILABLE, i.e. already offered to pantries, so each shelf has
-# a few items to put in a pickup basket. UPCs are filled in from the catalog
-# above wherever the name matches.
+# What the two other shelves hold: (name, category, hours until sell-by,
+# quantity). Everything is AVAILABLE, i.e. already offered to pantries. Items
+# are one row per unit, so a quantity of 12 is twelve identical rows, which is
+# what a scanned delivery produces and what the pantry's Quantity column
+# counts. UPCs are filled in from the catalog above wherever the name matches.
 EXTRA_SHELF_STOCK = {
     "Willow Glen Shelf": [
-        ("Strawberries 1lb", "Produce", 30),
-        ("Bananas Bunch", "Produce", 20),
-        ("Baby Spinach 5oz", "Produce", 14),
-        ("Greek Yogurt 6-pack", "Dairy", 40),
-        ("Cheddar Block 8oz", "Dairy", 60),
-        ("Sourdough Loaf", "Bakery", 10),
-        ("Whole Wheat Bread Loaf", "Bakery", 18),
-        ("Canned Black Beans 15oz", "Pantry", 300),
+        ("Strawberries 1lb", "Produce", 30, 6),
+        ("Bananas Bunch", "Produce", 20, 12),
+        ("Baby Spinach 5oz", "Produce", 14, 8),
+        ("Greek Yogurt 6-pack", "Dairy", 40, 10),
+        ("Cheddar Block 8oz", "Dairy", 60, 4),
+        ("Sourdough Loaf", "Bakery", 10, 5),
+        ("Whole Wheat Bread Loaf", "Bakery", 18, 6),
+        ("Canned Black Beans 15oz", "Pantry", 300, 24),
     ],
     "Berryessa Shelf": [
-        ("Apples 3lb Bag", "Produce", 72),
-        ("Carrots 2lb Bag", "Produce", 96),
-        ("Whole Milk, 1 gal", "Dairy", 16),
-        ("Bagels 6ct", "Bakery", 22),
-        ("Blueberry Muffins 4ct", "Bakery", 12),
+        ("Apples 3lb Bag", "Produce", 72, 10),
+        ("Carrots 2lb Bag", "Produce", 96, 15),
+        ("Whole Milk, 1 gal", "Dairy", 16, 8),
+        ("Bagels 6ct", "Bakery", 22, 6),
+        ("Blueberry Muffins 4ct", "Bakery", 12, 4),
     ],
+}
+
+# How many identical units of each AVAILABLE item the TEST Shelf holds. Anything
+# not listed is a single unit.
+TEST_QUANTITY = {
+    "Whole Milk, 1 gal": 6,
+    "Greek Yogurt 6-pack": 8,
+    "Sourdough Loaf": 4,
+    "Bananas Bunch": 10,
+    "Whole Wheat Bread Loaf": 5,
+    "Apples 3lb Bag": 8,
+    "Canned Diced Tomatoes 14.5oz": 12,
 }
 
 
@@ -349,44 +362,67 @@ def main():
                 expiration.apply_rules_to_item(db, item, rules=rules)
                 db.add(item)
                 created_items[name] = item
+                # A delivery arrives as several identical units, one row each.
+                # Only offered food is multiplied: the review and reserved
+                # rows below stay single so each demo state is one clear row.
+                if item_status == models.ItemStatus.AVAILABLE:
+                    for _ in range(TEST_QUANTITY.get(name, 1) - 1):
+                        db.add(models.Item(**{
+                            c.name: getattr(item, c.name)
+                            for c in models.Item.__table__.columns
+                            if c.name not in ("id", "created_at", "updated_at")
+                        }))
             db.flush()
-            print(f"  created: 1 shelf, {len(items)} items")
+            units = db.query(models.Item).filter(models.Item.store_id == store.id).count()
+            print(f"  created: 1 shelf, {units} items ({len(items)} kinds)")
 
-            # Three reservations so both dashboards have real state on
-            # first load: one pickup later today, one tomorrow to exercise
-            # the 24-hour horizon, and one already collected so the status
-            # column and the organizer's History card are not single-valued.
+            # Two orders so both dashboards have real state on first load,
+            # shown the way pantries use the portal: an order with its own ID
+            # and one QR code covering several items.
+            #   - a pending order of two items, later today
+            #   - an order already collected, so the organizer's history and
+            #     the staff schedule are not single-valued
             #
-            # Built directly rather than through crud.create_reservation,
-            # for the same reason the items above are: that function
-            # validates and commits a live request, and the collected one
-            # could not be expressed through it at all.
-            reservations = [
-                ("Butter 1lb",      now + timedelta(hours=3),  models.ReservationStatus.PENDING),
-                ("Heavy Cream 1qt", now + timedelta(hours=20), models.ReservationStatus.PENDING),
-                ("Bagels 6ct",      now - timedelta(hours=2),  models.ReservationStatus.PICKED_UP),
+            # Built directly rather than through crud.create_order, for the
+            # same reason the items above are: that function validates and
+            # commits a live request, and the collected one could not be
+            # expressed through it at all.
+            orders = [
+                (["Butter 1lb", "Heavy Cream 1qt"], now + timedelta(hours=3), models.ReservationStatus.PENDING),
+                (["Bagels 6ct"], now - timedelta(hours=2), models.ReservationStatus.PICKED_UP),
             ]
-            for item_name, scheduled, res_status in reservations:
-                code = secrets.token_urlsafe(16)
-                db.add(
-                    models.Reservation(
-                        item_id=created_items[item_name].id,
-                        pantry_id=pantry.id,
-                        status=res_status,
-                        reserved_at=now - timedelta(hours=1),
-                        scheduled_pickup_at=scheduled,
-                        hold_expires_at=scheduled + schemas.PICKUP_GRACE,
-                        qr_code=code,
-                        picked_up_at=(
-                            scheduled + timedelta(minutes=15)
-                            if res_status == models.ReservationStatus.PICKED_UP
-                            else None
-                        ),
-                    )
+            for item_names, scheduled, res_status in orders:
+                order = models.PickupOrder(
+                    pantry_id=pantry.id,
+                    store_id=store.id,
+                    qr_code=secrets.token_urlsafe(16),
+                    scheduled_pickup_at=scheduled,
+                    hold_expires_at=scheduled + schemas.PICKUP_GRACE,
                 )
+                db.add(order)
+                db.flush()
+                for item_name in item_names:
+                    db.add(
+                        models.Reservation(
+                            item_id=created_items[item_name].id,
+                            pantry_id=pantry.id,
+                            order_id=order.id,
+                            status=res_status,
+                            reserved_at=now - timedelta(hours=1),
+                            scheduled_pickup_at=scheduled,
+                            hold_expires_at=scheduled + schemas.PICKUP_GRACE,
+                            # The order carries the one code.
+                            qr_code=None,
+                            picked_up_at=(
+                                scheduled + timedelta(minutes=15)
+                                if res_status == models.ReservationStatus.PICKED_UP
+                                else None
+                            ),
+                        )
+                    )
                 if res_status == models.ReservationStatus.PENDING:
-                    demo_codes.append((item_name, code))
-            print(f"  created: {len(reservations)} reservations")
+                    demo_codes.append((" + ".join(item_names), order.qr_code))
+            print(f"  created: {len(orders)} orders")
 
             # One scan left mid-flow, so the Intake tab has something in its
             # confirmation queue on first load: a barcode that resolved, a
@@ -452,25 +488,30 @@ def main():
             db.flush()
             loc_now = datetime.utcnow()
             by_name = {p[1]: p[0] for p in DEMO_PRODUCTS}
-            for name, category, hours in stock:
+            sell_by_for = {}
+            for name, category, hours, quantity in stock:
                 code = upc_lib.normalize(by_name[name]) if name in by_name else None
                 product = upc_lib.find_product(db, code) if code else None
-                loc_item = models.Item(
-                    store_id=loc.id,
-                    shelf_id=loc_shelf.id,
-                    name=name,
-                    category=category,
-                    upc=code,
-                    product_id=product.id if product else None,
-                    status=models.ItemStatus.AVAILABLE,
-                    sell_by_date=loc_now + timedelta(hours=hours),
-                    date_label_type=models.DateLabelType.SELL_BY,
-                    date_source=models.DateSource.MANUAL,
-                    arrival_date=loc_now - timedelta(days=1),
-                )
-                expiration.apply_rules_to_item(db, loc_item, rules=rules)
-                db.add(loc_item)
-            print(f"  created: 1 shelf, {len(stock)} available items")
+                # Identical units must share one sell-by to read as one row.
+                sell_by_for[name] = loc_now + timedelta(hours=hours)
+                for _ in range(quantity):
+                    loc_item = models.Item(
+                        store_id=loc.id,
+                        shelf_id=loc_shelf.id,
+                        name=name,
+                        category=category,
+                        upc=code,
+                        product_id=product.id if product else None,
+                        status=models.ItemStatus.AVAILABLE,
+                        sell_by_date=sell_by_for[name],
+                        date_label_type=models.DateLabelType.SELL_BY,
+                        date_source=models.DateSource.MANUAL,
+                        arrival_date=loc_now - timedelta(days=1),
+                    )
+                    expiration.apply_rules_to_item(db, loc_item, rules=rules)
+                    db.add(loc_item)
+            units = sum(q for *_, q in stock)
+            print(f"  created: 1 shelf, {units} available items ({len(stock)} kinds)")
 
         db.commit()
         print("\nDone. Sign in at the login page with:")
