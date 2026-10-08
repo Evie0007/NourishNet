@@ -26,6 +26,9 @@ const secondary =
  *  320px-wide frame is ~75k pixels, which is instant. */
 const ANALYSIS_WIDTH = 320;
 
+/** Share of the frame ignored on each side; the guide box is what's left. */
+const FRAME_INSET = 0.15;
+
 const SHARE_COLORS = { green: "bg-lime-500", yellow: "bg-yellow-400", brown: "bg-amber-800" };
 
 export default function RipenessCheck() {
@@ -35,6 +38,8 @@ export default function RipenessCheck() {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [snapshot, setSnapshot] = useState("");
+  const [devices, setDevices] = useState([]);
+  const [deviceId, setDeviceId] = useState("");
 
   function stopCamera() {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -43,6 +48,17 @@ export default function RipenessCheck() {
 
   // Release the camera when the tab is left, or the webcam light stays on.
   useEffect(() => stopCamera, []);
+
+  // Labels are blank until the page has camera permission, so list cameras
+  // after a stream is open. Failing to list never stops the open camera.
+  async function listCameras() {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      setDevices(all.filter((d) => d.kind === "videoinput"));
+    } catch {
+      // The camera already open keeps working.
+    }
+  }
 
   async function startCamera() {
     setError("");
@@ -58,7 +74,9 @@ export default function RipenessCheck() {
         height: { ideal: 720 },
       });
       streamRef.current = stream;
+      setDeviceId(stream.getVideoTracks()[0]?.getSettings().deviceId || "");
       setOpen(true);
+      listCameras();
     } catch (err) {
       setError(describeCameraError(err, "ripeness"));
     }
@@ -72,6 +90,27 @@ export default function RipenessCheck() {
     }
   }, [open]);
 
+  async function switchCamera(id) {
+    setError("");
+    try {
+      const next = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: id }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      // Only release the old camera once the new one is open, so a camera
+      // that refuses to start leaves the working one on screen.
+      stopCamera();
+      streamRef.current = next;
+      setDeviceId(id);
+      if (videoRef.current) {
+        videoRef.current.srcObject = next;
+        videoRef.current.play().catch(() => {});
+      }
+    } catch (err) {
+      setError(describeCameraError(err, "ripeness"));
+    }
+  }
+
   function closeCamera() {
     stopCamera();
     setOpen(false);
@@ -83,12 +122,18 @@ export default function RipenessCheck() {
       setError("The camera isn't ready yet — wait a second and try again.");
       return;
     }
-    const scale = ANALYSIS_WIDTH / video.videoWidth;
+    // Only the middle of the frame is judged. The table, a hand and the
+    // shadowed edges all read as "brown", and the fruit is meant to be in
+    // the guide box, so the rest of the picture is ignored.
+    const sx = video.videoWidth * FRAME_INSET;
+    const sy = video.videoHeight * FRAME_INSET;
+    const sw = video.videoWidth * (1 - 2 * FRAME_INSET);
+    const sh = video.videoHeight * (1 - 2 * FRAME_INSET);
     const canvas = document.createElement("canvas");
     canvas.width = ANALYSIS_WIDTH;
-    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.height = Math.round((sh / sw) * ANALYSIS_WIDTH);
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
 
     setError("");
     setSnapshot(canvas.toDataURL("image/jpeg", 0.8));
@@ -98,7 +143,7 @@ export default function RipenessCheck() {
   return (
     <Card title="Fruit freshness check">
       <p className="mb-3 text-sm text-gray-600">
-        Hold a piece of fruit in front of the camera against a plain background, in even light.
+        Hold a piece of fruit inside the white box against a plain background, in even light.
         The estimate comes from skin colour only — it helps decide what to donate first, and the
         printed date still governs.
       </p>
@@ -115,19 +160,35 @@ export default function RipenessCheck() {
         </button>
       ) : (
         <div className="space-y-3">
-          <video
-            ref={videoRef}
-            playsInline
-            muted
-            className="w-full max-w-md rounded-lg bg-black"
-          />
-          <div className="flex gap-2">
+          <div className="relative w-full max-w-md overflow-hidden rounded-lg bg-black">
+            <video ref={videoRef} playsInline muted className="block w-full" />
+            <div
+              aria-hidden="true"
+              style={{ inset: `${FRAME_INSET * 100}%` }}
+              className="pointer-events-none absolute rounded-lg border-2 border-white/70"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
             <button onClick={capture} className={primary}>
               Check fruit
             </button>
             <button onClick={closeCamera} className={secondary}>
               Stop camera
             </button>
+            {devices.length > 1 && (
+              <select
+                value={deviceId}
+                onChange={(e) => switchCamera(e.target.value)}
+                aria-label="Camera"
+                className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+              >
+                {devices.map((device, index) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label || `Camera ${index + 1}`}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
         </div>
       )}
