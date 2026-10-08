@@ -216,10 +216,11 @@ const SUMMARY_ORDER = [
 ];
 
 function Overview({ counts, nearExpiry, reservations, shelves, shelfName, onError, onChanged }) {
-  // Scan state lives here, not in either card, because both the Confirm
-  // pickup button and the Pickup schedule button open the same camera.
-  // Two mounted scanners would mean two getUserMedia calls, and on a
-  // single-camera laptop the second one fails with NotReadableError.
+  // Scan state lives here, not in the schedule card, because the scanner
+  // renders full width below it and the camera result and the typed code
+  // both go through the same confirm(). One mounted scanner at a time keeps
+  // to a single getUserMedia call: on a single-camera laptop a second one
+  // fails with NotReadableError.
   const [scanOpen, setScanOpen] = useState(false);
   const [outcome, setOutcome] = useState(null);
 
@@ -255,32 +256,20 @@ function Overview({ counts, nearExpiry, reservations, shelves, shelfName, onErro
         ))}
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-3">
-        <PickupScan
-          outcome={outcome}
-          scanOpen={scanOpen}
-          onScan={() => {
-            setOutcome(null);
-            setScanOpen((open) => !open);
-          }}
-          onConfirmCode={confirm}
-        />
+      <PickupSchedule
+        reservations={reservations}
+        scanOpen={scanOpen}
+        onScan={() => {
+          setOutcome(null);
+          setScanOpen((open) => !open);
+        }}
+        outcome={outcome}
+        onConfirmCode={confirm}
+      />
 
-        <div className="lg:col-span-2">
-          <PickupSchedule
-            reservations={reservations}
-            scanOpen={scanOpen}
-            onScan={() => {
-              setOutcome(null);
-              setScanOpen((open) => !open);
-            }}
-          />
-        </div>
-      </div>
-
-      {/* One scanner for both buttons, full width because a 320px-tall
-          video does not belong in a narrow grid column. Unmounted rather
-          than hidden, so the camera light actually goes off. */}
+      {/* Full width, because a 320px-tall video does not belong in a narrow
+          grid column. Unmounted rather than hidden, so the camera light
+          actually goes off. */}
       {scanOpen && (
         <BarcodeScanner
           mode="qr"
@@ -354,6 +343,35 @@ function ShelfConditionCard({ shelf }) {
 /* ---------------- Pickup (FR-3.10, FR-9.4, FR-9.10) ---------------- */
 
 /**
+ * The result of the last scan or typed code, kept in the card rather than only
+ * in the page-level banner: a staff member holding a phone at the shelf is
+ * looking at the scanner, not above the fold. Names the whole trip for a
+ * multi-item order.
+ */
+function ScanOutcome({ outcome }) {
+  if (!outcome) return null;
+  if (!outcome.ok) {
+    return (
+      <div className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
+        {outcome.message}
+      </div>
+    );
+  }
+  const { reservation } = outcome;
+  return (
+    <div className="mb-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+      Collected:{" "}
+      <span className="font-medium">
+        {reservation.order_item_names?.length > 1
+          ? `${reservation.order_item_names.length} items (${reservation.order_item_names.join(", ")})`
+          : reservation.item_name}
+      </span>{" "}
+      by {reservation.pantry_name} at {formatTime(reservation.picked_up_at)}.
+    </div>
+  );
+}
+
+/**
  * Camera first, keyboard second.
  *
  * The code is already a QR on the organizer's phone, so typing out
@@ -362,7 +380,7 @@ function ShelfConditionCard({ shelf }) {
  * a browser without camera permission must not be able to block a handoff
  * (FR-9.10).
  */
-function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
+function ManualCodeEntry({ onConfirmCode }) {
   const [manualOpen, setManualOpen] = useState(false);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -379,44 +397,12 @@ function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
   }
 
   return (
-    <Card title="Confirm pickup">
-      <p className="mb-3 text-sm text-gray-500">
-        Scan the QR code on the organizer's phone. Staff confirm the handoff —
-        the pantry cannot confirm its own.
-      </p>
-
-      <button
-        type="button"
-        onClick={onScan}
-        aria-expanded={scanOpen}
-        className="w-full rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
-      >
-        {scanOpen ? "Close camera" : "Scan QR code"}
-      </button>
-
-      {outcome?.ok && (
-        <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
-          Collected:{" "}
-          <span className="font-medium">
-            {outcome.reservation.order_item_names?.length > 1
-              ? `${outcome.reservation.order_item_names.length} items (${outcome.reservation.order_item_names.join(", ")})`
-              : outcome.reservation.item_name}
-          </span>{" "}
-          by {outcome.reservation.pantry_name} at{" "}
-          {formatTime(outcome.reservation.picked_up_at)}.
-        </div>
-      )}
-      {outcome && !outcome.ok && (
-        <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
-          {outcome.message}
-        </div>
-      )}
-
+    <div className="mt-3">
       <button
         type="button"
         onClick={() => setManualOpen((open) => !open)}
         aria-expanded={manualOpen}
-        className="mt-3 text-xs font-medium text-gray-500 underline hover:text-gray-800"
+        className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
       >
         {manualOpen ? "Hide manual entry" : "Can't scan? Enter code"}
       </button>
@@ -439,7 +425,7 @@ function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
           </button>
         </form>
       )}
-    </Card>
+    </div>
   );
 }
 
@@ -453,7 +439,7 @@ function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
 const RESOLVED_VISIBLE_HOURS = 4;
 const SCHEDULE_ROW_LIMIT = 12;
 
-function PickupSchedule({ reservations, scanOpen, onScan }) {
+function PickupSchedule({ reservations, scanOpen, onScan, outcome, onConfirmCode }) {
   const rows = useMemo(() => {
     const cutoff = Date.now() - RESOLVED_VISIBLE_HOURS * 3600_000;
     const sorted = reservations
@@ -495,6 +481,13 @@ function PickupSchedule({ reservations, scanOpen, onScan }) {
         </button>
       }
     >
+      <p className="mb-3 text-sm text-gray-500">
+        Scan the QR code on the organizer's phone. Staff confirm the handoff —
+        the pantry cannot confirm its own.
+      </p>
+
+      <ScanOutcome outcome={outcome} />
+
       {shown.length === 0 ? (
         <Empty>No pickups scheduled.</Empty>
       ) : (
@@ -511,6 +504,8 @@ function PickupSchedule({ reservations, scanOpen, onScan }) {
           )}
         </>
       )}
+
+      <ManualCodeEntry onConfirmCode={onConfirmCode} />
     </Card>
   );
 }
