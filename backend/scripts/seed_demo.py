@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
-from app import expiration, geocode, models, schemas, upc as upc_lib
+from app import expiration, models, schemas, upc as upc_lib
 
 # Real, check-digit-valid barcodes so the intake scanner can be demonstrated
 # by typing one of these into the UPC field. They are ordinary retail codes;
@@ -56,23 +56,69 @@ ORG_EMAIL = os.getenv("DEMO_ORG_EMAIL", "nourishnet26+organizer@gmail.com")
 DEMO_ORG_NAME = "Second Harvest Demo Pantry"
 DEMO_ORG_EIN = "94-2960297"
 
-# The store the demo shelves and the demo staff account belong to. Every
-# store-side view is scoped to a store, so without this the staff login would
-# see an empty dashboard (NFR-4.6.1).
-DEMO_STORE_NAME = "Demo Market"
-DEMO_STORE_ADDRESS = "750 Curtner Ave, San Jose, CA 95125"
+# The project has three smart shelves at three different locations, so the demo
+# has three. A "location" is a Store row; each one holds a single shelf.
+#
+# Addresses are ordinary San Jose streets and the coordinates are approximate,
+# written down here rather than looked up: a demo pin that depends on a live
+# geocoder can land somewhere else on presentation day. The seed owns these
+# rows, so a re-run resets them to what is below.
+#
+# `legacy` is the name an earlier version of this script gave the same row.
+# Looking it up too means a database seeded before the rename is renamed in
+# place rather than left with a stale store beside the new one.
+DEMO_LOCATIONS = [
+    {
+        # The one the demo staff account belongs to. Every store-side view is
+        # scoped to a store, so without this link the staff login would see an
+        # empty dashboard (NFR-4.6.1).
+        "name": "TEST Shelf",
+        "legacy": "Demo Market",
+        "address": "123 S 1st St, San Jose, CA 95113",
+        "coords": (37.3331, -121.8896),   # downtown San Jose
+        "open": True,
+    },
+    {
+        "name": "Willow Glen Shelf",
+        "legacy": "Demo Market East",
+        "address": "1150 Lincoln Ave, San Jose, CA 95125",
+        "coords": (37.3016, -121.8996),   # Willow Glen
+        "open": True,
+    },
+    {
+        # Stocked but closed, so the pantry map has an "unavailable" shelf to
+        # show without anyone having to stage one.
+        "name": "Berryessa Shelf",
+        "legacy": None,
+        "address": "1700 Berryessa Rd, San Jose, CA 95133",
+        "coords": (37.3727, -121.8700),   # Berryessa
+        "open": False,
+    },
+]
+DEMO_STORE_NAME = DEMO_LOCATIONS[0]["name"]
 
-# A second location of the same demo, so the pantry map has two markers to
-# choose between on presentation day.
-DEMO_STORE_EAST_NAME = "Demo Market East"
-DEMO_STORE_EAST_ADDRESS = "Valley Fair area, San Jose, CA 95128"
-
-# Approximate, for the demo only. Used when a store has no coordinates yet
-# and the geocoder is off. With GEOCODE_ENABLED=true the address is looked up
-# instead. Existing coordinates are never overwritten.
-DEMO_COORDS = {
-    DEMO_STORE_NAME: (37.3382, -121.8863),        # downtown San Jose
-    DEMO_STORE_EAST_NAME: (37.3230, -121.9466),   # near Valley Fair
+# What the two other shelves hold: (name, category, hours until sell-by).
+# Everything is AVAILABLE, i.e. already offered to pantries, so each shelf has
+# a few items to put in a pickup basket. UPCs are filled in from the catalog
+# above wherever the name matches.
+EXTRA_SHELF_STOCK = {
+    "Willow Glen Shelf": [
+        ("Strawberries 1lb", "Produce", 30),
+        ("Bananas Bunch", "Produce", 20),
+        ("Baby Spinach 5oz", "Produce", 14),
+        ("Greek Yogurt 6-pack", "Dairy", 40),
+        ("Cheddar Block 8oz", "Dairy", 60),
+        ("Sourdough Loaf", "Bakery", 10),
+        ("Whole Wheat Bread Loaf", "Bakery", 18),
+        ("Canned Black Beans 15oz", "Pantry", 300),
+    ],
+    "Berryessa Shelf": [
+        ("Apples 3lb Bag", "Produce", 72),
+        ("Carrots 2lb Bag", "Produce", 96),
+        ("Whole Milk, 1 gal", "Dairy", 16),
+        ("Bagels 6ct", "Bakery", 22),
+        ("Blueberry Muffins 4ct", "Bakery", 12),
+    ],
 }
 
 
@@ -161,37 +207,29 @@ def main():
         pantry.verified = True
         db.flush()
 
-        print("Store:")
-        store = db.query(models.Store).filter(models.Store.name == DEMO_STORE_NAME).first()
-        if store is None:
-            store = models.Store(name=DEMO_STORE_NAME, address=DEMO_STORE_ADDRESS, active=True)
-            db.add(store)
+        print("Locations (the three shelves on the pantry map):")
+        locations = {}
+        for spec in DEMO_LOCATIONS:
+            names = [n for n in (spec["name"], spec["legacy"]) if n]
+            found = db.query(models.Store).filter(models.Store.name.in_(names)).all()
+            # Prefer a row already under the new name; otherwise adopt the
+            # legacy one so it is renamed rather than duplicated.
+            loc = next((r for r in found if r.name == spec["name"]), None) or (found[0] if found else None)
+            verb = "updated"
+            if loc is None:
+                loc = models.Store()
+                db.add(loc)
+                verb = "created"
+            loc.name = spec["name"]
+            loc.address = spec["address"]
+            loc.latitude, loc.longitude = spec["coords"]
+            loc.active = True
+            loc.open_for_pickup = spec["open"]
             db.flush()
-            print(f"  created: {DEMO_STORE_NAME}")
-        else:
-            print(f"  updated: {DEMO_STORE_NAME}")
-
-        print("Second location:")
-        east = db.query(models.Store).filter(models.Store.name == DEMO_STORE_EAST_NAME).first()
-        if east is None:
-            east = models.Store(name=DEMO_STORE_EAST_NAME, address=DEMO_STORE_EAST_ADDRESS, active=True)
-            db.add(east)
-            db.flush()
-            print(f"  created: {DEMO_STORE_EAST_NAME}")
-        else:
-            print(f"  updated: {DEMO_STORE_EAST_NAME}")
-
-        print("Locations (for the pantry map):")
-        for named in (store, east):
-            if named.latitude is not None and named.longitude is not None:
-                print(f"  kept:    {named.name} already located")
-                continue
-            coords = geocode.geocode_address(named.address) or DEMO_COORDS.get(named.name)
-            if coords:
-                named.latitude, named.longitude = coords
-                print(f"  set:     {named.name}")
-            else:
-                print(f"  skipped: {named.name} has no coordinates")
+            locations[spec["name"]] = loc
+            state = "open" if spec["open"] else "closed"
+            print(f"  {verb}: {spec['name']} ({state}) — {spec['address']}")
+        store = locations[DEMO_STORE_NAME]
 
         print("Users:")
         upsert_user(
@@ -217,44 +255,38 @@ def main():
         # demo-able state (e.g. every item already picked up).
         force_inventory = "--with-inventory" in sys.argv
         demo_codes = []
-        if db.query(models.Shelf).count() == 0 or force_inventory:
+        if db.query(models.Shelf).filter(models.Shelf.store_id == store.id).count() == 0 or force_inventory:
             print("Sample inventory:")
             now = datetime.utcnow()
-            shelves = [
-                models.Shelf(name="Shelf A — Dairy", location="Aisle 3, north end", camera_id="cam-a1"),
-                models.Shelf(name="Shelf B — Bakery", location="Front of store", camera_id="cam-b1"),
-                models.Shelf(name="Shelf C — Produce", location="Aisle 1", camera_id="cam-c1"),
-                models.Shelf(name="Shelf D — Meat & Pantry", location="Aisle 5, back wall", camera_id="cam-d1"),
-            ]
-            for shelf in shelves:
-                shelf.store_id = store.id
-                db.add(shelf)
+            # One physical smart shelf per location. The sensor readings are
+            # fresh, so the shelf card does not show the stale-sensor warning.
+            shelf = models.Shelf(
+                store_id=store.id,
+                name="TEST Shelf",
+                location=store.address,
+                camera_id="cam-test-1",
+                current_temperature_c=4.1,
+                current_humidity_pct=58.0,
+                last_reading_at=now,
+            )
+            db.add(shelf)
             db.flush()
-            shelves[0].current_temperature_c = 3.4
-            shelves[0].current_humidity_pct = 62.0
-            shelves[0].last_reading_at = now
-            shelves[1].current_temperature_c = 20.8
-            shelves[1].current_humidity_pct = 44.0
-            shelves[1].last_reading_at = now - timedelta(minutes=4)
-            shelves[3].current_temperature_c = 1.7
-            shelves[3].current_humidity_pct = 58.0
-            shelves[3].last_reading_at = now - timedelta(minutes=1)
 
             items = [
-                # name,                  sku,         category, shelf, status,                    +hours, upc
+                # name,                  sku,         category, status,                    +hours, upc
                 # Already in the donation pool — the organizer sees these.
-                ("Whole Milk, 1 gal",    "DAIRY-001", "Dairy",  0, models.ItemStatus.AVAILABLE,     12, "036000291452"),
-                ("Greek Yogurt 6-pack",  "DAIRY-014", "Dairy",  0, models.ItemStatus.AVAILABLE,     20, "038000356216"),
-                ("Sourdough Loaf",       "BAKE-003",  "Bakery", 1, models.ItemStatus.AVAILABLE,      8, "041196910759"),
+                ("Whole Milk, 1 gal",    "DAIRY-001", "Dairy", models.ItemStatus.AVAILABLE,     12, "036000291452"),
+                ("Greek Yogurt 6-pack",  "DAIRY-014", "Dairy", models.ItemStatus.AVAILABLE,     20, "038000356216"),
+                ("Sourdough Loaf",       "BAKE-003",  "Bakery", models.ItemStatus.AVAILABLE,      8, "041196910759"),
                 # Waiting on staff review — the staff review queue.
-                ("Sliced Turkey 12oz",   None,        "Deli",   0, models.ItemStatus.NEEDS_REVIEW,  30, None),
-                ("Blueberry Muffins 4ct","BAKE-021",  "Bakery", 1, models.ItemStatus.NEEDS_REVIEW,  16, "028400157155"),
+                ("Sliced Turkey 12oz",   None,        "Deli", models.ItemStatus.NEEDS_REVIEW,  30, None),
+                ("Blueberry Muffins 4ct","BAKE-021",  "Bakery", models.ItemStatus.NEEDS_REVIEW,  16, "028400157155"),
                 # Approaching sell-by — the near-expiry panel. The sweep will
                 # walk these forward on its own within a minute of starting up,
                 # which is the point of seeding them here.
-                ("Baby Spinach 5oz",     "PROD-118",  "Produce",2, models.ItemStatus.IN_STOCK,      26, "681131022217"),
-                ("Strawberries 1lb",     "PROD-092",  "Produce",2, models.ItemStatus.IN_STOCK,      40, None),
-                ("Cheddar Block 8oz",    "DAIRY-077", "Dairy",  0, models.ItemStatus.IN_STOCK,     400, "073731000106"),
+                ("Baby Spinach 5oz",     "PROD-118",  "Produce", models.ItemStatus.IN_STOCK,      26, "681131022217"),
+                ("Strawberries 1lb",     "PROD-092",  "Produce", models.ItemStatus.IN_STOCK,      40, None),
+                ("Cheddar Block 8oz",    "DAIRY-077", "Dairy", models.ItemStatus.IN_STOCK,     400, "073731000106"),
                 # Already spoken for — these back the three reservations
                 # below, so the staff Pickup schedule and the organizer's
                 # QR code both have something to show on first load.
@@ -264,28 +296,28 @@ def main():
                 # short-dated item here would empty the schedule card within
                 # a minute of seeding and look like a bug in the feature
                 # rather than a correctly-working safety rule.
-                ("Butter 1lb",           "DAIRY-031", "Dairy",  0, models.ItemStatus.RESERVED,      48, None),
-                ("Heavy Cream 1qt",      "DAIRY-052", "Dairy",  0, models.ItemStatus.RESERVED,      60, None),
-                ("Bagels 6ct",           "BAKE-011",  "Bakery", 1, models.ItemStatus.PICKED_UP,     36, "000284001199"),
+                ("Butter 1lb",           "DAIRY-031", "Dairy", models.ItemStatus.RESERVED,      48, None),
+                ("Heavy Cream 1qt",      "DAIRY-052", "Dairy", models.ItemStatus.RESERVED,      60, None),
+                ("Bagels 6ct",           "BAKE-011",  "Bakery", models.ItemStatus.PICKED_UP,     36, "000284001199"),
                 # More of the everyday grocery mix, so the demo isn't just
                 # dairy and bakery — produce, pantry staples, and meat each
                 # get a representative or two.
-                ("Whole Wheat Bread Loaf","BAKE-034",  "Bakery", 1, models.ItemStatus.IN_STOCK,      60, "041500291208"),
-                ("Carrots 2lb Bag",      "PROD-201",  "Produce",2, models.ItemStatus.IN_STOCK,     300, "000333836208"),
-                ("Apples 3lb Bag",       "PROD-207",  "Produce",2, models.ItemStatus.IN_STOCK,     280, "000333837205"),
-                ("Bananas Bunch",        "PROD-205",  "Produce",2, models.ItemStatus.AVAILABLE,       6, "000420000451"),
-                ("Canned Black Beans 15oz","PANT-010","Pantry", 3, models.ItemStatus.IN_STOCK,   17000, "024000098621"),
-                ("Canned Diced Tomatoes 14.5oz","PANT-011","Pantry",3, models.ItemStatus.AVAILABLE,  2, "024000016304"),
-                ("Pretzels 10oz",        "PANT-022",  "Pantry", 3, models.ItemStatus.IN_STOCK,    4200, "000284005098"),
+                ("Whole Wheat Bread Loaf","BAKE-034",  "Bakery", models.ItemStatus.AVAILABLE,     60, "041500291208"),
+                ("Carrots 2lb Bag",      "PROD-201",  "Produce", models.ItemStatus.IN_STOCK,     300, "000333836208"),
+                ("Apples 3lb Bag",       "PROD-207",  "Produce", models.ItemStatus.AVAILABLE,     80, "000333837205"),
+                ("Bananas Bunch",        "PROD-205",  "Produce", models.ItemStatus.AVAILABLE,       6, "000420000451"),
+                ("Canned Black Beans 15oz","PANT-010","Pantry", models.ItemStatus.IN_STOCK,   17000, "024000098621"),
+                ("Canned Diced Tomatoes 14.5oz","PANT-011","Pantry", models.ItemStatus.AVAILABLE,  2, "024000016304"),
+                ("Pretzels 10oz",        "PANT-022",  "Pantry", models.ItemStatus.IN_STOCK,    4200, "000284005098"),
                 # Meat's auto_publish is False (staff always inspect before
                 # any meat is offered), so these are the demo's proof that
                 # the automation correctly declines to act on its own.
-                ("Ground Beef 1lb 80/20","MEAT-004",  "Meat",   3, models.ItemStatus.NEEDS_REVIEW,   18, None),
-                ("Chicken Breast 1lb",   "MEAT-009",  "Meat",   3, models.ItemStatus.IN_STOCK,       14, "002144120422"),
+                ("Ground Beef 1lb 80/20","MEAT-004",  "Meat", models.ItemStatus.NEEDS_REVIEW,   18, None),
+                ("Chicken Breast 1lb",   "MEAT-009",  "Meat", models.ItemStatus.IN_STOCK,       14, "002144120422"),
             ]
             rules = expiration.load_rules(db)
             created_items = {}
-            for name, sku, category, shelf_idx, item_status, hours, upc in items:
+            for name, sku, category, item_status, hours, upc in items:
                 code = upc_lib.normalize(upc) if upc else None
                 product = upc_lib.find_product(db, code) if code else None
                 item = models.Item(
@@ -294,7 +326,7 @@ def main():
                     upc=code,
                     product_id=product.id if product else None,
                     category=category,
-                    shelf_id=shelves[shelf_idx].id,
+                    shelf_id=shelf.id,
                     status=item_status,
                     sell_by_date=now + timedelta(hours=hours),
                     date_label_type=models.DateLabelType.SELL_BY,
@@ -318,7 +350,7 @@ def main():
                 db.add(item)
                 created_items[name] = item
             db.flush()
-            print(f"  created: {len(shelves)} shelves, {len(items)} items")
+            print(f"  created: 1 shelf, {len(items)} items")
 
             # Three reservations so both dashboards have real state on
             # first load: one pickup later today, one tomorrow to exercise
@@ -367,7 +399,7 @@ def main():
                     store_id=store.id,
                     upc=milk.upc,
                     product_id=milk.id,
-                    shelf_id=shelves[0].id,
+                    shelf_id=shelf.id,
                     quantity=4,
                     ocr_raw_text=(
                         f"GRADE A WHOLE MILK\nPKD {(now - timedelta(days=3)).strftime('%m/%d/%y')}\n"
@@ -398,33 +430,47 @@ def main():
         else:
             print("Sample inventory: skipped (shelves already exist)")
 
-        # The second location's food. Only added while that location has none,
-        # so a re-run does not keep piling stock onto it.
-        if db.query(models.Item).filter(models.Item.store_id == east.id).count() == 0:
-            print("Second location's shelf and stock:")
-            east_shelf = models.Shelf(store_id=east.id, name="Shelf E — Produce", location="Front of store")
-            db.add(east_shelf)
+        # The other two locations' shelves and food. Each is stocked only while
+        # it has no items, so a re-run does not keep piling stock onto it.
+        rules = expiration.load_rules(db)
+        for loc_name, stock in EXTRA_SHELF_STOCK.items():
+            loc = locations[loc_name]
+            if db.query(models.Item).filter(models.Item.store_id == loc.id).count() > 0:
+                print(f"{loc_name}: skipped (already stocked)")
+                continue
+            print(f"{loc_name}:")
+            loc_shelf = models.Shelf(
+                store_id=loc.id,
+                name=loc_name,
+                location=loc.address,
+                camera_id=f"cam-{loc_name.split()[0].lower()}-1",
+                current_temperature_c=3.8,
+                current_humidity_pct=60.0,
+                last_reading_at=datetime.utcnow(),
+            )
+            db.add(loc_shelf)
             db.flush()
-            east_now = datetime.utcnow()
-            for name, category, hours in [
-                ("Strawberries 1lb", "Produce", 30),
-                ("Bananas Bunch", "Produce", 20),
-                ("Greek Yogurt 6-pack", "Dairy", 40),
-            ]:
-                east_item = models.Item(
-                    store_id=east.id,
-                    shelf_id=east_shelf.id,
+            loc_now = datetime.utcnow()
+            by_name = {p[1]: p[0] for p in DEMO_PRODUCTS}
+            for name, category, hours in stock:
+                code = upc_lib.normalize(by_name[name]) if name in by_name else None
+                product = upc_lib.find_product(db, code) if code else None
+                loc_item = models.Item(
+                    store_id=loc.id,
+                    shelf_id=loc_shelf.id,
                     name=name,
                     category=category,
+                    upc=code,
+                    product_id=product.id if product else None,
                     status=models.ItemStatus.AVAILABLE,
-                    sell_by_date=east_now + timedelta(hours=hours),
+                    sell_by_date=loc_now + timedelta(hours=hours),
                     date_label_type=models.DateLabelType.SELL_BY,
                     date_source=models.DateSource.MANUAL,
-                    arrival_date=east_now - timedelta(days=1),
+                    arrival_date=loc_now - timedelta(days=1),
                 )
-                expiration.apply_rules_to_item(db, east_item)
-                db.add(east_item)
-            print("  created: 1 shelf, 3 available items")
+                expiration.apply_rules_to_item(db, loc_item, rules=rules)
+                db.add(loc_item)
+            print(f"  created: 1 shelf, {len(stock)} available items")
 
         db.commit()
         print("\nDone. Sign in at the login page with:")

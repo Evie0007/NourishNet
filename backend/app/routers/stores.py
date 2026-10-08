@@ -8,11 +8,13 @@ Who creates what:
     staff to any store in their brand. Brand-level accounts are created by
     a platform admin only, since a brand account can see a whole chain.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .. import auth, crud, models, schemas
+from .. import auth, crud, geocode, models, schemas
 from ..database import get_db
 from .auth import _to_auth_user
 
@@ -50,6 +52,58 @@ def store_map(
     from GET /items, which is already limited to active stores.
     """
     return crud.list_mappable_stores(db)
+
+
+@router.get("/pickup-locations", response_model=schemas.PickupLocationsOut)
+def pickup_locations(
+    zip_code: Optional[str] = Query(None, alias="zip"),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_organizer),
+):
+    """
+    The pantry map and its side panel (FR-8.14): every located shelf with how
+    much it has to collect and whether it is available. With `zip`, the
+    result is ordered nearest-first and each location carries its distance.
+
+    The zip is geocoded here, never in the browser, so the lookup service sees
+    one identifying user-agent from us and the rate limit is ours to respect.
+    A zip that can't be located is a 422 that says so — the map itself still
+    loads without one.
+    """
+    center = None
+    center_out = None
+    if zip_code is not None and zip_code.strip():
+        normalized = geocode.normalize_zip(zip_code)
+        if not normalized:
+            raise HTTPException(status_code=422, detail="Enter a 5-digit US zip code.")
+        center = geocode.geocode_zip(normalized)
+        if not center:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Couldn't locate zip code {normalized}. Check it, or browse the map instead.",
+            )
+        center_out = {"zip": normalized, "latitude": center[0], "longitude": center[1]}
+    return {"center": center_out, "locations": crud.list_pickup_locations(db, center=center)}
+
+
+@router.patch("/{store_id}/availability", response_model=schemas.StoreOut)
+def set_availability(
+    store_id: str,
+    payload: schemas.StoreAvailabilityUpdate,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_role(models.UserRole.MANAGER, models.UserRole.ADMIN)),
+):
+    """
+    A manager marks their own location open or closed for pickups (FR-8.14).
+    Scoped to the caller's stores; another store's id reads as not found.
+    """
+    visible = auth.visible_store_ids(db, user)
+    if visible is not None and store_id not in visible:
+        raise HTTPException(status_code=404, detail="Store not found")
+    store = crud.set_store_open(db, store_id, payload.open_for_pickup)
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return store
 
 
 @router.patch("/{store_id}", response_model=schemas.StoreOut)

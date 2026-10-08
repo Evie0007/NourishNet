@@ -44,6 +44,14 @@ NEW_COLUMNS = {
     },
     "reservations": {
         "scheduled_pickup_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
+        # Multi-item pickups. pickup_orders is a new table, so create_all
+        # makes it; this is the column on the existing table that points at it.
+        "order_id": {"postgresql": "UUID REFERENCES pickup_orders(id)", "sqlite": "CHAR(32) REFERENCES pickup_orders(id)"},
+    },
+    # Existing stores stay open: the default is what keeps a location on the
+    # pantry map as available after this runs.
+    "stores": {
+        "open_for_pickup": {"postgresql": "BOOLEAN NOT NULL DEFAULT TRUE", "sqlite": "BOOLEAN NOT NULL DEFAULT 1"},
     },
     "products": {
         "unit_value": {"postgresql": "NUMERIC(10,2)", "sqlite": "NUMERIC(10,2)"},
@@ -84,6 +92,7 @@ NEW_INDEXES = [
     ("ix_reservations_status", "reservations", "status"),
     ("ix_reservations_hold_expires_at", "reservations", "hold_expires_at"),
     ("ix_reservations_scheduled_pickup_at", "reservations", "scheduled_pickup_at"),
+    ("ix_reservations_order_id", "reservations", "order_id"),
     ("ix_users_store_id", "users", "store_id"),
     ("ix_shelves_store_id", "shelves", "store_id"),
     ("ix_items_store_id", "items", "store_id"),

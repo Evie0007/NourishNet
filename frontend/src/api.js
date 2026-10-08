@@ -147,8 +147,16 @@ export const api = {
   registerPantry: (data) => post("/pantries", data),
   listPantries: () => request("/pantries"),
 
-  // Stores with a location, for the pantry map (plan Phase 3).
-  pantryMap: () => request("/stores/map"),
+  // ---- stores ----
+  // Shelf locations for the pantry map, each with its availability. With a
+  // zip, nearest first and with distances; a zip the server can't locate
+  // comes back as an error whose message is safe to show.
+  pickupLocations: (zip) =>
+    request(zip ? `/stores/pickup-locations?zip=${encodeURIComponent(zip)}` : "/stores/pickup-locations"),
+  listStores: () => request("/stores"),
+  // Manager-only: close or reopen a location for pickups.
+  setStoreOpen: (storeId, openForPickup) =>
+    patch(`/stores/${storeId}/availability`, { open_for_pickup: openForPickup }),
 
   // ---- reservations ----
   // `scheduledPickupLocal` is the raw value out of an
@@ -159,6 +167,14 @@ export const api = {
       item_id: itemId,
       scheduled_pickup_at: toUtcIso(scheduledPickupLocal),
     }),
+  // Several items, one trip, one QR code. All or nothing: if any item is no
+  // longer available the server reserves none and names the one that failed.
+  createOrder: (itemIds, scheduledPickupLocal) =>
+    post("/reservations/orders", {
+      item_ids: itemIds,
+      scheduled_pickup_at: toUtcIso(scheduledPickupLocal),
+    }),
+  cancelOrder: (orderId) => post(`/reservations/orders/${orderId}/cancel`),
   myReservations: () => request("/reservations/mine"),
   allReservations: () => request("/reservations"),
   cancelReservation: (id) => post(`/reservations/${id}/cancel`),

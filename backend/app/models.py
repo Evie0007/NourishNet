@@ -130,6 +130,13 @@ class Store(Base):
     # the pantry pool and their staff see an empty view (auth.visible_store_ids).
     active = Column(Boolean, default=True, nullable=False)
 
+    # Whether pantries can collect from this location right now. A manager
+    # flips it when the store is closed or cannot hand food over today. It is
+    # separate from `active` on purpose: `active` withdraws a store from the
+    # platform (and empties its staff's view), while this only pauses pickups
+    # and shows the shelf as "unavailable" on the pantry map.
+    open_for_pickup = Column(Boolean, default=True, nullable=False)
+
     brand_id = Column(UUID(as_uuid=False), ForeignKey("brands.id"), nullable=True)
     brand = relationship("Brand")
 
@@ -434,11 +441,43 @@ class Reservation(Base):
 
     hold_expires_at = Column(DateTime, nullable=False, index=True)   # scheduled_pickup_at + PICKUP_GRACE
 
+    # Null for a reservation that belongs to a pickup order: the order holds
+    # the one QR code, so the item has no code of its own to show or scan.
     qr_code = Column(String, nullable=True, unique=True)
     picked_up_at = Column(DateTime, nullable=True)
 
+    order_id = Column(UUID(as_uuid=False), ForeignKey("pickup_orders.id"), nullable=True, index=True)
+    order = relationship("PickupOrder", back_populates="reservations")
+
     item = relationship("Item", back_populates="reservations")
     pantry = relationship("Pantry", back_populates="reservations")
+
+
+class PickupOrder(Base):
+    """
+    Several reserved items collected in one trip under one QR code.
+
+    The items are still ordinary reservations, one per item, so claiming,
+    expiry, cancellation and the donation record all work exactly as they do
+    for a single reservation. The order adds only what a trip needs and a
+    single item does not have: one shared QR code, and one shared slot and
+    hold window. Its status is not stored — it is read off its reservations,
+    so it cannot drift from them.
+
+    An order is always for one store: a trip goes to one place.
+    """
+    __tablename__ = "pickup_orders"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    pantry_id = Column(UUID(as_uuid=False), ForeignKey("pantries.id"), nullable=False, index=True)
+    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id"), nullable=False, index=True)
+    qr_code = Column(String, nullable=False, unique=True)
+    scheduled_pickup_at = Column(DateTime, nullable=False)
+    hold_expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    reservations = relationship("Reservation", back_populates="order")
+    store = relationship("Store")
 
 
 class DonationRecord(Base):

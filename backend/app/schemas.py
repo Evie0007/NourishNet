@@ -368,6 +368,7 @@ class StoreOut(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     active: bool
+    open_for_pickup: bool = True
     brand_id: Optional[str] = None
 
 
@@ -376,6 +377,45 @@ class StoreUpdate(BaseModel):
     name: Optional[str] = None
     address: Optional[str] = None
     active: Optional[bool] = None
+
+
+class StoreAvailabilityUpdate(BaseModel):
+    """Staff mark their own location open or closed for pickups."""
+    open_for_pickup: bool
+
+
+class PickupLocationOut(BaseModel):
+    """
+    One shelf location as the pantry map and its side panel show it.
+
+    `available` is the single answer the panel needs: a location is available
+    when it is open for pickups and has at least one item to collect. When it
+    is not, `unavailable_reason` says why, so the panel can say "Closed" or
+    "No items right now" rather than a bare "unavailable".
+    """
+    id: str
+    name: str
+    address: Optional[str] = None
+    latitude: float
+    longitude: float
+    open_for_pickup: bool
+    available_count: int
+    available: bool
+    unavailable_reason: Optional[Literal["closed", "no_items"]] = None
+    # Straight-line distance from the searched zip code. None when no zip was
+    # searched, rather than 0, which would read as "you are standing here".
+    distance_miles: Optional[float] = None
+
+
+class SearchCenterOut(BaseModel):
+    zip: str
+    latitude: float
+    longitude: float
+
+
+class PickupLocationsOut(BaseModel):
+    center: Optional[SearchCenterOut] = None
+    locations: list[PickupLocationOut]
 
 
 class StoreMapOut(BaseModel):
@@ -460,12 +500,10 @@ SCHEDULE_HORIZON = timedelta(hours=24)
 SUBMIT_SKEW = timedelta(minutes=2)
 
 
-class ReservationCreate(BaseModel):
-    """Note the absence of pantry_id: FR-2.3 requires the acting
-    organization to come from the authenticated user's account, never from
-    the request body. Accepting it here would let any coordinator reserve
-    food in another organization's name."""
-    item_id: str
+class _ScheduledPickup(BaseModel):
+    """The pickup slot, and the rules for it, shared by a single reservation
+    and a multi-item order so the two can never disagree about what a valid
+    time is."""
 
     # AwareDatetime, not datetime. A naive value means a browser sent local
     # wall time without converting it, and reading that as UTC is a
@@ -505,6 +543,32 @@ class ReservationCreate(BaseModel):
         return self
 
 
+class ReservationCreate(_ScheduledPickup):
+    """Note the absence of pantry_id: FR-2.3 requires the acting
+    organization to come from the authenticated user's account, never from
+    the request body. Accepting it here would let any coordinator reserve
+    food in another organization's name."""
+    item_id: str
+
+
+# More than this in one trip is a warehouse run, not a shelf pickup, and a
+# long list makes one slow request that claims many rows at once.
+MAX_ORDER_ITEMS = 20
+
+
+class PickupOrderCreate(_ScheduledPickup):
+    """Several items, one trip, one QR code (FR-8.13). Same rule as
+    ReservationCreate: the organization comes from the account, not the body."""
+    item_ids: list[str] = Field(min_length=1, max_length=MAX_ORDER_ITEMS)
+
+    @field_validator("item_ids")
+    @classmethod
+    def _no_duplicates(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Each item can be added to a pickup only once.")
+        return value
+
+
 class ReservationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -528,6 +592,14 @@ class ReservationDetailOut(ReservationOut):
     item_sell_by_date: Optional[datetime] = None
     shelf_name: Optional[str] = None
     pantry_name: Optional[str] = None
+    store_name: Optional[str] = None
+    # Set when the item is part of a multi-item pickup. The order's one QR
+    # code is what gets shown and scanned; the item's own `qr_code` is empty.
+    order_id: Optional[str] = None
+    order_qr_code: Optional[str] = None
+    # Every item name in the order, so a scan of the order code can report the
+    # whole trip rather than just the first item.
+    order_item_names: Optional[list[str]] = None
 
 
 # ---------- Donation records (FR-11.1) ----------

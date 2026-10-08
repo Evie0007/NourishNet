@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, formatCurrency, parseUtc } from "../api";
+import { useAuth } from "../auth";
 import BarcodeScanner from "../components/BarcodeScanner";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
 import Intake from "./Intake";
@@ -23,22 +24,26 @@ export default function StaffDashboard() {
   const [shelves, setShelves] = useState([]);
   const [nearExpiry, setNearExpiry] = useState([]);
   const [reservations, setReservations] = useState([]);
+  const [stores, setStores] = useState([]);
   const [error, setError] = useState("");
   const [tab, setTab] = useState("overview");
+  const { user } = useAuth();
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const [i, s, n, r] = await Promise.all([
+      const [i, s, n, r, st] = await Promise.all([
         api.listItems(),
         api.listShelves(),
         api.listNearExpiry(48),
         api.allReservations(),
+        api.listStores(),
       ]);
       setItems(i);
       setShelves(s);
       setNearExpiry(n);
       setReservations(r);
+      setStores(st);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -76,6 +81,13 @@ export default function StaffDashboard() {
       subtitle="Review label reads, publish donations, and confirm pickups at the shelf."
     >
       <ErrorBanner message={error} onDismiss={() => setError("")} />
+
+      <PickupAvailability
+        stores={stores}
+        canEdit={user?.role === "manager" || user?.role === "admin"}
+        onError={setError}
+        onChanged={refresh}
+      />
 
       <nav className="mb-6 flex flex-wrap gap-1 border-b border-gray-200">
         {TABS.map((t) => (
@@ -127,6 +139,68 @@ export default function StaffDashboard() {
         </>
       )}
     </Shell>
+  );
+}
+
+/* ---------------- Pickup availability (FR-8.14) ---------------- */
+
+/**
+ * Whether pantries can collect from this location right now. Closing it turns
+ * the shelf grey ("unavailable") on the pantry map and hides its food from
+ * the donation list. Reservations already made are honoured: closing stops new
+ * ones, it doesn't cancel a pantry's trip.
+ *
+ * Managers only. Plain staff see the state but can't change it.
+ */
+function PickupAvailability({ stores, canEdit, onError, onChanged }) {
+  const [busyId, setBusyId] = useState(null);
+  if (stores.length === 0) return null;
+
+  async function toggle(store) {
+    setBusyId(store.id);
+    onError("");
+    try {
+      await api.setStoreOpen(store.id, !store.open_for_pickup);
+      await onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <div className="mb-6 space-y-2">
+      {stores.map((store) => (
+        <div
+          key={store.id}
+          className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${
+            store.open_for_pickup
+              ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+              : "border-amber-200 bg-amber-50 text-amber-900"
+          }`}
+        >
+          <div className="min-w-0">
+            <span className="font-medium">{store.name}</span>{" "}
+            {store.open_for_pickup ? "is open for pickups." : "is closed for pickups."}
+            <span className="block text-xs opacity-80">
+              {store.open_for_pickup
+                ? "Pantries can see and reserve its food on the map."
+                : "It shows as unavailable on the pantry map and its food is hidden. Reservations already made still stand."}
+            </span>
+          </div>
+          {canEdit && (
+            <button
+              onClick={() => toggle(store)}
+              disabled={busyId === store.id}
+              className="rounded-lg border border-current px-3 py-1.5 text-sm font-medium hover:bg-white/60 disabled:opacity-60"
+            >
+              {store.open_for_pickup ? "Close for pickups" : "Reopen for pickups"}
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -322,7 +396,12 @@ function PickupScan({ outcome, scanOpen, onScan, onConfirmCode }) {
 
       {outcome?.ok && (
         <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
-          Collected: <span className="font-medium">{outcome.reservation.item_name}</span>{" "}
+          Collected:{" "}
+          <span className="font-medium">
+            {outcome.reservation.order_item_names?.length > 1
+              ? `${outcome.reservation.order_item_names.length} items (${outcome.reservation.order_item_names.join(", ")})`
+              : outcome.reservation.item_name}
+          </span>{" "}
           by {outcome.reservation.pantry_name} at{" "}
           {formatTime(outcome.reservation.picked_up_at)}.
         </div>
@@ -377,7 +456,7 @@ const SCHEDULE_ROW_LIMIT = 12;
 function PickupSchedule({ reservations, scanOpen, onScan }) {
   const rows = useMemo(() => {
     const cutoff = Date.now() - RESOLVED_VISIBLE_HOURS * 3600_000;
-    return reservations
+    const sorted = reservations
       .filter((r) => {
         if (r.status === "pending") return true;
         const resolved = parseUtc(r.picked_up_at || r.hold_expires_at);
@@ -390,6 +469,14 @@ function PickupSchedule({ reservations, scanOpen, onScan }) {
           (parseUtc(a.scheduled_pickup_at)?.getTime() ?? Infinity) -
           (parseUtc(b.scheduled_pickup_at)?.getTime() ?? Infinity),
       );
+    // One row per trip: items collected under one order code are one handoff.
+    const groups = new Map();
+    for (const r of sorted) {
+      const key = r.order_id || r.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    return [...groups.values()];
   }, [reservations]);
 
   const shown = rows.slice(0, SCHEDULE_ROW_LIMIT);
@@ -413,8 +500,8 @@ function PickupSchedule({ reservations, scanOpen, onScan }) {
       ) : (
         <>
           <ul className="divide-y divide-gray-100">
-            {shown.map((r) => (
-              <ScheduleRow key={r.id} reservation={r} />
+            {shown.map((group) => (
+              <ScheduleRow key={group[0].order_id || group[0].id} group={group} />
             ))}
           </ul>
           {rows.length > shown.length && (
@@ -428,7 +515,9 @@ function PickupSchedule({ reservations, scanOpen, onScan }) {
   );
 }
 
-function ScheduleRow({ reservation }) {
+function ScheduleRow({ group }) {
+  // A trip is still due while any of its items is pending, so it leads.
+  const reservation = group.find((r) => r.status === "pending") || group[0];
   const slot = parseUtc(reservation.scheduled_pickup_at);
   // The point of the card for a manager: who was due and hasn't turned up.
   const overdue = reservation.status === "pending" && slot && slot.getTime() < Date.now();
@@ -445,7 +534,10 @@ function ScheduleRow({ reservation }) {
           {overdue && <span className="ml-2 text-xs font-normal">· overdue</span>}
         </div>
         <div className="mt-0.5 truncate text-xs text-gray-500">
-          {reservation.item_name} · {reservation.pantry_name}
+          {group.length > 1
+            ? `${group.length} items (${group.map((r) => r.item_name).join(", ")})`
+            : reservation.item_name}{" "}
+          · {reservation.pantry_name}
         </div>
       </div>
       <StatusBadge status={reservation.status} />

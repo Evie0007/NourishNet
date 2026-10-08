@@ -43,7 +43,7 @@ Nothing runs from the repo root except git.
 |---|---|---|
 | `/` | Anyone | Welcome + sign in (one form, both roles). Also holds the pantry self-registration form. |
 | `/staff` | `staff`, `manager`, `admin` | Intake station, status counts, OCR review queue, near-expiry list, expiration rules, shelf conditions, inventory, QR pickup confirmation |
-| `/organizer` | `org_coordinator` | Available donations, reserve, QR code for pickup, hold-window countdown, cancel |
+| `/organizer` | `org_coordinator` | Map of shelf locations with a zip-code finder and per-shelf availability, available donations, reserve one item or **Add to pickup** for several items under one QR code, hold-window countdown, cancel |
 
 Sign-in routes each user to their own dashboard based on the role the server
 returns — never on which URL was typed.
@@ -173,6 +173,10 @@ npm run dev
 
 Set `VITE_API_URL` in `frontend/.env` to wherever the API is running.
 
+`npm run build` reads the committed `frontend/.env.production`, which points
+at the live Render API. To build a bundle that talks to a local API instead,
+use `npx vite build --mode demo`, which reads `.env`.
+
 ## Demo accounts
 
 The testing-phase accounts are created by the seed script. Passwords come from
@@ -195,6 +199,18 @@ land somewhere you can read them. The script also creates a pre-verified demo
 pantry, sample shelves and items, the default expiration rules, a small UPC
 catalog, and one intake scan left mid-flow so the Intake tab has something in
 its queue. Re-running it updates the accounts rather than duplicating them.
+
+The seed creates the project's three shelves, each at its own address on the
+pantry map: **TEST Shelf** (the staff login's location, fully stocked),
+**Willow Glen Shelf** (open), and **Berryessa Shelf** (stocked but closed, so
+the map has an "unavailable" shelf to show). Try zip codes `95113`, `95125`
+and `95133`. A manager can close or reopen their own shelf from the top of
+the store dashboard. A database seeded before the rename keeps working:
+re-running the seed renames "Demo Market" in place.
+
+The zip-code finder geocodes through OpenStreetMap's Nominatim, which is off
+unless `GEOCODE_ENABLED=true` is set on the API; with it off the map still
+works and the finder says it couldn't locate the zip.
 
 To demonstrate the scanner without hardware, type one of the seeded barcodes
 into the UPC field — `036000291452` (milk), `041196910759` (sourdough), or
