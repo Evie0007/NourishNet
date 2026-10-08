@@ -81,7 +81,8 @@ $env:DEMO_ORG_PASSWORD="<pick something long>"
 Both run from `backend/`, which is where `app/` and `scripts/` live.
 
 `upgrade_schema` adds the intake tables and columns to a database that
-predates them, and backfills expiration deadlines onto existing items —
+predates them (most recently `stores.open_for_pickup`, `reservations.order_id` and
+the `pickup_orders` table, for multi-item pickups and the open/closed switch), and backfills expiration deadlines onto existing items —
 without it, older stock has no deadlines and the sweep cannot see it. It is
 idempotent and a no-op once the database is current.
 

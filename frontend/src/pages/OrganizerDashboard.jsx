@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { api, parseUtc, toLocalInputValue } from "../api";
 import { useAuth } from "../auth";
 import Shell, { Card, Empty, ErrorBanner, StatusBadge } from "../components/Shell";
-import StoreMap from "../components/StoreMap";
+import ShelfFinder from "../components/ShelfFinder";
 
 // Mirrors schemas.SCHEDULE_HORIZON and PICKUP_GRACE on the backend. The
 // server is authoritative — these only shape the control so it cannot
@@ -28,13 +28,25 @@ export default function OrganizerDashboard() {
   const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState("sell_by");
   const [category, setCategory] = useState("");
-  // Stores with a location, for the map. Only the ones on the map can be
-  // picked there; the list still shows food from stores that are not located.
-  const [stores, setStores] = useState([]);
+  // Shelf locations for the map and its side panel, each with its own
+  // availability. The ones not on the map (no coordinates) can't be picked
+  // there; the list below still shows their food.
+  const [locations, setLocations] = useState([]);
   const [selectedStoreId, setSelectedStoreId] = useState(null);
+  // The zip being searched, and where it is. A ref as well as state, so the
+  // timed refresh keeps using the search without being rebuilt every time.
+  const [center, setCenter] = useState(null);
+  const zipRef = useRef("");
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   // Which row has its pickup-time picker open. One at a time — a list of
   // half-filled forms is worse than a single focused one.
   const [schedulingId, setSchedulingId] = useState(null);
+  // Items added to the pickup in progress. Held here rather than on the
+  // server: nothing is claimed until the organization confirms a time, so
+  // browsing with a full basket takes nothing off anyone else.
+  const [basket, setBasket] = useState([]);
+  const [basketNotice, setBasketNotice] = useState("");
 
   const verified = user?.pantry_verified === true;
 
@@ -43,17 +55,42 @@ export default function OrganizerDashboard() {
       const [items, mine, places] = await Promise.all([
         api.listItems(),
         api.myReservations(),
-        api.pantryMap(),
+        // A zip that stops resolving mid-session (the lookup service blips)
+        // falls back to the plain list rather than failing the whole refresh.
+        api.pickupLocations(zipRef.current).catch(() => api.pickupLocations()),
       ]);
       setAvailable(items);
       setReservations(mine);
-      setStores(places);
+      setLocations(places.locations);
+      setCenter(places.center);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
   }, []);
+
+  async function searchZip(zip) {
+    setSearching(true);
+    setSearchError("");
+    try {
+      const result = await api.pickupLocations(zip);
+      zipRef.current = result.center.zip;
+      setCenter(result.center);
+      setLocations(result.locations);
+      setSelectedStoreId(null);
+    } catch (err) {
+      setSearchError(err.message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function clearZip() {
+    zipRef.current = "";
+    setSearchError("");
+    refresh();
+  }
 
   useEffect(() => {
     refresh();
@@ -64,19 +101,26 @@ export default function OrganizerDashboard() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  const storeNames = useMemo(
-    () => Object.fromEntries(stores.map((s) => [s.id, s.name])),
-    [stores],
-  );
+  // Someone else may claim an item while it sits in the basket. Drop it and
+  // say so, rather than letting the whole order fail on it later.
+  useEffect(() => {
+    const gone = basket.filter((b) => !available.some((i) => i.id === b.id));
+    if (gone.length === 0) return;
+    setBasket(basket.filter((b) => available.some((i) => i.id === b.id)));
+    setBasketNotice(
+      gone.length === 1
+        ? `“${gone[0].name}” was taken or is no longer available, so it was removed from your pickup.`
+        : `${gone.length} items were taken or are no longer available, so they were removed from your pickup.`,
+    );
+    // Only when the donation list changes — not on every basket edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [available]);
 
-  const countByStore = useMemo(
-    () =>
-      available.reduce((counts, item) => {
-        counts[item.store_id] = (counts[item.store_id] || 0) + 1;
-        return counts;
-      }, {}),
-    [available],
+  const storeNames = useMemo(
+    () => Object.fromEntries(locations.map((s) => [s.id, s.name])),
+    [locations],
   );
+  const basketStoreId = basket[0]?.store_id ?? null;
 
   const categories = useMemo(
     () => [...new Set(available.map((i) => i.category).filter(Boolean))].sort(),
@@ -109,6 +153,10 @@ export default function OrganizerDashboard() {
     );
   const past = reservations.filter((r) => r.status !== "pending");
 
+  // One card per trip: reservations sharing an order are shown together under
+  // their one QR code; a lone reservation is its own card.
+  const pickups = groupPickups(active);
+
   async function reserve(itemId, scheduledLocal) {
     setError("");
     try {
@@ -120,10 +168,49 @@ export default function OrganizerDashboard() {
     }
   }
 
-  async function cancel(reservationId) {
+  function toggleInBasket(item) {
+    setError("");
+    setBasketNotice("");
+    if (basket.some((b) => b.id === item.id)) {
+      setBasket(basket.filter((b) => b.id !== item.id));
+      return;
+    }
+    // One trip goes to one shelf. Say which, so the fix is obvious.
+    if (basket.length > 0 && item.store_id !== basketStoreId) {
+      setError(
+        `Your pickup is at ${storeNames[basketStoreId] || "another shelf"}, and a pickup covers one ` +
+          `location. Reserve or clear it first to add items from ${storeNames[item.store_id] || "this shelf"}.`,
+      );
+      return;
+    }
+    setSchedulingId(null);
+    setBasket([...basket, item]);
+  }
+
+  async function placeOrder(scheduledLocal) {
     setError("");
     try {
-      await api.cancelReservation(reservationId);
+      await api.createOrder(
+        basket.map((b) => b.id),
+        scheduledLocal,
+      );
+      setBasket([]);
+      setBasketNotice("");
+      await refresh();
+    } catch (err) {
+      setError(err.message);
+      // The refresh also drops anything that was just taken, so the basket
+      // on screen matches what can actually be reserved.
+      await refresh();
+    }
+  }
+
+  async function cancelPickup(group) {
+    setError("");
+    try {
+      const first = group[0];
+      if (first.order_id) await api.cancelOrder(first.order_id);
+      else await api.cancelReservation(first.id);
       await refresh();
     } catch (err) {
       setError(err.message);
@@ -152,46 +239,35 @@ export default function OrganizerDashboard() {
         <p className="text-sm text-gray-500">Loading…</p>
       ) : (
         <div className="grid gap-6 lg:grid-cols-5">
-          <div className="space-y-6 lg:col-span-3">
-            {stores.length > 0 && (
-              <Card
-                title="Where the food is"
-                action={
-                  selectedStoreId && (
-                    <button
-                      onClick={() => setSelectedStoreId(null)}
-                      className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
-                    >
-                      Show all stores
-                    </button>
-                  )
-                }
-              >
-                <StoreMap
-                  stores={stores}
-                  countByStore={countByStore}
-                  selectedId={selectedStoreId}
-                  onSelect={(id) => setSelectedStoreId(id === selectedStoreId ? null : id)}
-                />
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {stores.map((store) => (
-                    <button
-                      key={store.id}
-                      onClick={() => setSelectedStoreId(store.id === selectedStoreId ? null : store.id)}
-                      aria-pressed={store.id === selectedStoreId}
-                      className={`rounded-full border px-3 py-1 text-xs font-medium ${
-                        store.id === selectedStoreId
-                          ? "border-emerald-600 bg-emerald-600 text-white"
-                          : "border-gray-300 text-gray-700 hover:border-emerald-500"
-                      }`}
-                    >
-                      {store.name} · {countByStore[store.id] || 0}
-                    </button>
-                  ))}
-                </div>
-              </Card>
-            )}
+          {locations.length > 0 && (
+            <Card
+              title="Where the food is"
+              className="lg:col-span-5"
+              action={
+                selectedStoreId && (
+                  <button
+                    onClick={() => setSelectedStoreId(null)}
+                    className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+                  >
+                    Show all shelves
+                  </button>
+                )
+              }
+            >
+              <ShelfFinder
+                locations={locations}
+                center={center}
+                selectedId={selectedStoreId}
+                onSelect={(id) => setSelectedStoreId(id === selectedStoreId ? null : id)}
+                onSearch={searchZip}
+                onClear={clearZip}
+                searching={searching}
+                searchError={searchError}
+              />
+            </Card>
+          )}
 
+          <div className="space-y-6 lg:col-span-3">
             <Card
               title={`Available donations (${visible.length})`}
               action={
@@ -237,19 +313,37 @@ export default function OrganizerDashboard() {
                             {formatDate(item.sell_by_date)}
                           </div>
                         </div>
-                        <button
-                          onClick={() =>
-                            setSchedulingId(schedulingId === item.id ? null : item.id)
-                          }
-                          disabled={!verified}
-                          aria-expanded={schedulingId === item.id}
-                          title={
-                            verified ? undefined : "Available once your organization is verified"
-                          }
-                          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-                        >
-                          {schedulingId === item.id ? "Close" : "Reserve"}
-                        </button>
+                        <div className="flex gap-2">
+                          {/* Several items, one trip, one QR code (FR-8.13). */}
+                          <button
+                            onClick={() => toggleInBasket(item)}
+                            disabled={!verified}
+                            aria-pressed={basket.some((b) => b.id === item.id)}
+                            title={
+                              verified ? undefined : "Available once your organization is verified"
+                            }
+                            className={`rounded-lg border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-400 ${
+                              basket.some((b) => b.id === item.id)
+                                ? "border-emerald-600 bg-emerald-50 text-emerald-800"
+                                : "border-emerald-600 text-emerald-700 hover:bg-emerald-50"
+                            }`}
+                          >
+                            {basket.some((b) => b.id === item.id) ? "✓ In pickup" : "Add to pickup"}
+                          </button>
+                          <button
+                            onClick={() =>
+                              setSchedulingId(schedulingId === item.id ? null : item.id)
+                            }
+                            disabled={!verified}
+                            aria-expanded={schedulingId === item.id}
+                            title={
+                              verified ? undefined : "Available once your organization is verified"
+                            }
+                            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                          >
+                            {schedulingId === item.id ? "Close" : "Reserve now"}
+                          </button>
+                        </div>
                       </div>
 
                       {schedulingId === item.id && (
@@ -267,13 +361,31 @@ export default function OrganizerDashboard() {
           </div>
 
           <div className="space-y-6 lg:col-span-2">
-            <Card title={`Your pickups (${active.length})`}>
-              {active.length === 0 ? (
+            {(basket.length > 0 || basketNotice) && (
+              <PickupBasket
+                basket={basket}
+                storeName={storeNames[basketStoreId]}
+                notice={basketNotice}
+                onRemove={toggleInBasket}
+                onClear={() => {
+                  setBasket([]);
+                  setBasketNotice("");
+                }}
+                onConfirm={placeOrder}
+              />
+            )}
+
+            <Card title={`Your pickups (${pickups.length})`}>
+              {pickups.length === 0 ? (
                 <Empty>No active reservations.</Empty>
               ) : (
                 <div className="space-y-4">
-                  {active.map((r) => (
-                    <ReservationCard key={r.id} reservation={r} onCancel={() => cancel(r.id)} />
+                  {pickups.map((group) => (
+                    <PickupCard
+                      key={group[0].order_id || group[0].id}
+                      group={group}
+                      onCancel={() => cancelPickup(group)}
+                    />
                   ))}
                 </div>
               )}
@@ -311,7 +423,14 @@ export default function OrganizerDashboard() {
  * re-deriving them every second would move the control's floor out from
  * under a value the person had already chosen.
  */
-function SchedulePicker({ item, onConfirm, onCancel }) {
+function SchedulePicker({
+  item,
+  onConfirm,
+  onCancel,
+  prompt = "When will you collect this?",
+  confirmLabel = "Confirm reservation",
+  subject = "This item",
+}) {
   const [value, setValue] = useState(() => toLocalInputValue(defaultSlot()));
   const [problem, setProblem] = useState("");
 
@@ -340,7 +459,7 @@ function SchedulePicker({ item, onConfirm, onCancel }) {
     if (value > max) {
       return setProblem(
         cappedByDiscard
-          ? "This item has to be off the shelf before then. Pick an earlier time."
+          ? `${subject} has to be off the shelf before then. Pick an earlier time.`
           : "Pickups can be booked up to 24 hours ahead.",
       );
     }
@@ -354,7 +473,7 @@ function SchedulePicker({ item, onConfirm, onCancel }) {
         htmlFor={`pickup-${item.id}`}
         className="block text-xs font-medium text-gray-700"
       >
-        When will you collect this?
+        {prompt}
       </label>
       <div className="mt-1.5 flex flex-wrap items-center gap-2">
         <input
@@ -369,23 +488,25 @@ function SchedulePicker({ item, onConfirm, onCancel }) {
           className="rounded-lg border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
         />
         <button className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700">
-          Confirm reservation
+          {confirmLabel}
         </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
-        >
-          Cancel
-        </button>
+        {onCancel && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+          >
+            Cancel
+          </button>
+        )}
       </div>
       <p className="mt-2 text-xs text-gray-500">
         Book up to 24 hours ahead. The hold is released {GRACE_MINUTES} minutes
-        after your slot, and the item goes back into the pool.
+        after your slot, and anything uncollected goes back into the pool.
         {cappedByDiscard && (
           <>
             {" "}
-            This one has to be off the shelf by {formatDateTime(item.discard_after)}.
+            {subject} has to be off the shelf by {formatDateTime(item.discard_after)}.
           </>
         )}
       </p>
@@ -403,7 +524,101 @@ function defaultSlot() {
   return d;
 }
 
-function ReservationCard({ reservation, onCancel }) {
+/**
+ * The pickup in progress: items added with "Add to pickup", waiting on a time.
+ * Nothing is reserved until the time is confirmed, and then it is all of them
+ * or none (FR-8.13).
+ */
+function PickupBasket({ basket, storeName, notice, onRemove, onClear, onConfirm }) {
+  // The earliest-dated item decides how late the slot may be: a slot past any
+  // one item's discard time would be refused, so the picker bounds itself by it.
+  const earliest = useMemo(() => {
+    const dated = basket
+      .map((b) => b.discard_after)
+      .filter(Boolean)
+      .sort((a, b) => parseUtc(a) - parseUtc(b));
+    return { id: "basket", discard_after: dated[0] ?? null };
+  }, [basket]);
+
+  return (
+    <Card
+      title={`Your pickup (${basket.length} item${basket.length === 1 ? "" : "s"})`}
+      action={
+        basket.length > 0 && (
+          <button
+            onClick={onClear}
+            className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+          >
+            Clear
+          </button>
+        )
+      }
+    >
+      {notice && (
+        <p role="status" className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          {notice}
+        </p>
+      )}
+      {basket.length > 0 && (
+        <>
+          {storeName && (
+            <p className="mb-2 text-xs text-gray-500">
+              Collect all of these at <span className="font-medium text-gray-700">{storeName}</span>{" "}
+              with one QR code.
+            </p>
+          )}
+          <ul className="divide-y divide-gray-100">
+            {basket.map((item) => (
+              <li key={item.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{item.name}</div>
+                  <div className="text-xs text-gray-500">
+                    {item.category || "Uncategorized"} · sell-by {formatDate(item.sell_by_date)}
+                  </div>
+                </div>
+                <button
+                  onClick={() => onRemove(item)}
+                  aria-label={`Remove ${item.name} from pickup`}
+                  className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+          <SchedulePicker
+            item={earliest}
+            prompt="When will you collect these?"
+            confirmLabel={`Reserve ${basket.length} item${basket.length === 1 ? "" : "s"}`}
+            subject="The earliest-dated item"
+            onConfirm={onConfirm}
+          />
+        </>
+      )}
+    </Card>
+  );
+}
+
+/**
+ * Reservations that share an order are one trip with one QR code, so they are
+ * shown as one card. A reservation with no order is its own group. The input
+ * is already sorted soonest-first, and groups keep the order they first appear.
+ */
+function groupPickups(reservations) {
+  const groups = new Map();
+  for (const r of reservations) {
+    const key = r.order_id || r.id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  return [...groups.values()];
+}
+
+function PickupCard({ group, onCancel }) {
+  const reservation = group[0];
+  const isOrder = Boolean(reservation.order_id);
+  // An order carries one code for every item in it; a lone reservation has its own.
+  const code = isOrder ? reservation.order_qr_code : reservation.qr_code;
   const [remaining, setRemaining] = useState(() => timeLeft(reservation.hold_expires_at));
 
   useEffect(() => {
@@ -420,11 +635,31 @@ function ReservationCard({ reservation, onCancel }) {
     <div className="rounded-lg border border-gray-200 p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="font-medium">{reservation.item_name}</div>
-          <div className="mt-0.5 text-xs text-gray-500">
-            {reservation.shelf_name || "Shelf not set"}
-            {reservation.item_category ? ` · ${reservation.item_category}` : ""}
-          </div>
+          {isOrder ? (
+            <>
+              <div className="font-medium">
+                {group.length} item{group.length === 1 ? "" : "s"}
+                {reservation.store_name ? ` · ${reservation.store_name}` : ""}
+              </div>
+              <ul className="mt-1 space-y-0.5 text-sm text-gray-700">
+                {group.map((r) => (
+                  <li key={r.id}>
+                    {r.item_name}
+                    {r.item_category && <span className="text-xs text-gray-500"> · {r.item_category}</span>}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <>
+              <div className="font-medium">{reservation.item_name}</div>
+              <div className="mt-0.5 text-xs text-gray-500">
+                {reservation.store_name ? `${reservation.store_name} · ` : ""}
+                {reservation.shelf_name || "Shelf not set"}
+                {reservation.item_category ? ` · ${reservation.item_category}` : ""}
+              </div>
+            </>
+          )}
         </div>
         <StatusBadge status={reservation.status} />
       </div>
@@ -440,14 +675,14 @@ function ReservationCard({ reservation, onCancel }) {
 
       {/* NFR-4.5.4: large and high-contrast — this gets read off a phone in
           store lighting. */}
-      {reservation.qr_code && (
+      {code && (
         <div className="mt-4 flex flex-col items-center gap-2 rounded-lg bg-white p-4">
-          <QRCodeSVG value={reservation.qr_code} size={200} level="M" marginSize={2} />
-          <code className="select-all text-center text-xs tracking-wide text-gray-500">
-            {reservation.qr_code}
-          </code>
+          <QRCodeSVG value={code} size={200} level="M" marginSize={2} />
+          <code className="select-all text-center text-xs tracking-wide text-gray-500">{code}</code>
           <p className="text-center text-xs text-gray-500">
-            Show this to store staff at the shelf.
+            {isOrder
+              ? "One code for everything above. Show it to store staff at the shelf."
+              : "Show this to store staff at the shelf."}
           </p>
         </div>
       )}
@@ -456,7 +691,7 @@ function ReservationCard({ reservation, onCancel }) {
         className={`mt-3 text-sm ${urgent ? "font-medium text-amber-700" : "text-gray-600"}`}
       >
         {remaining.expired
-          ? "Hold window has lapsed — this item may have returned to the pool."
+          ? `Hold window has lapsed — ${isOrder ? "these items" : "this item"} may have returned to the pool.`
           : `${remaining.label} left to collect — the hold is released at ${formatTime(
               reservation.hold_expires_at,
             )}, ${GRACE_MINUTES} minutes after your slot.`}
@@ -466,7 +701,7 @@ function ReservationCard({ reservation, onCancel }) {
         onClick={onCancel}
         className="mt-3 text-xs font-medium text-gray-500 underline hover:text-gray-800"
       >
-        Cancel reservation
+        {isOrder ? "Cancel whole pickup" : "Cancel reservation"}
       </button>
     </div>
   );

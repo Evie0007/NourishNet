@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from .. import auth, crud, models, schemas
 from ..database import get_db
@@ -12,6 +12,13 @@ router = APIRouter(prefix="/reservations", tags=["reservations"])
 def _detail(res: models.Reservation) -> schemas.ReservationDetailOut:
     """Flattens the joined item/shelf/pantry names the dashboards display."""
     item = res.item
+    order = res.order
+    # An item has no store relationship of its own, only a store_id.
+    store = None
+    if order is not None:
+        store = order.store
+    elif item is not None and item.store_id:
+        store = object_session(res).get(models.Store, item.store_id)
     return schemas.ReservationDetailOut(
         **schemas.ReservationOut.model_validate(res).model_dump(),
         item_name=item.name if item else None,
@@ -19,7 +26,36 @@ def _detail(res: models.Reservation) -> schemas.ReservationDetailOut:
         item_sell_by_date=item.sell_by_date if item else None,
         shelf_name=item.shelf.name if item and item.shelf else None,
         pantry_name=res.pantry.org_name if res.pantry else None,
+        store_name=store.name if store else None,
+        order_id=order.id if order else None,
+        order_qr_code=order.qr_code if order else None,
+        order_item_names=(
+            [
+                r.item.name
+                for r in order.reservations
+                if r.item and r.status not in (
+                    models.ReservationStatus.CANCELLED,
+                    models.ReservationStatus.EXPIRED,
+                )
+            ]
+            if order
+            else None
+        ),
     )
+
+
+def _require_verified(user: models.User) -> None:
+    """FR-7.4: unverified organizations may browse but not reserve. This is
+    the gate the Good Samaritan Act protection depends on (NFR-4.8.3)."""
+    if not (user.pantry and user.pantry.verified):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Your organization is still pending verification. "
+                "You can browse available donations, but reserving is "
+                "unavailable until a NourishNet admin verifies your EIN."
+            ),
+        )
 
 
 @router.post("", response_model=schemas.ReservationDetailOut)
@@ -39,17 +75,7 @@ def reserve_item(
     is acceptable — they hit the 403 on the next attempt — but it is why
     the verification test below cannot assume it runs first.
     """
-    # FR-7.4: unverified organizations may browse but not reserve. This is
-    # the gate the Good Samaritan Act protection depends on (NFR-4.8.3).
-    if not (user.pantry and user.pantry.verified):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Your organization is still pending verification. "
-                "You can browse available donations, but reserving is "
-                "unavailable until a NourishNet admin verifies your EIN."
-            ),
-        )
+    _require_verified(user)
 
     reservation, outcome = crud.create_reservation(db, res, pantry_id=user.pantry_id)
     if outcome == "unavailable":
@@ -68,6 +94,64 @@ def reserve_item(
             ),
         )
     return _detail(reservation)
+
+
+@router.post("/orders", response_model=list[schemas.ReservationDetailOut])
+def reserve_order(
+    order: schemas.PickupOrderCreate,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_organizer),
+):
+    """
+    Reserves several items from one location for a single trip, and returns
+    them all carrying the one QR code that covers the order (FR-8.13).
+
+    All or nothing: if any item can't be had, none is reserved and the message
+    names the one that stopped it, so the organization can drop it and retry.
+    """
+    _require_verified(user)
+
+    db_order, outcome, item_name = crud.create_order(db, order, pantry_id=user.pantry_id)
+    if outcome == "unavailable":
+        which = f"“{item_name}”" if item_name else "One of those items"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{which} was just reserved by someone else, or its location has "
+                "closed. Nothing was reserved — remove it and try again."
+            ),
+        )
+    if outcome == "mixed_stores":
+        raise HTTPException(
+            status_code=422,
+            detail="A pickup covers one location. Make a separate pickup for items at another shelf.",
+        )
+    if outcome == "past_discard":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"“{item_name}” has to be off the shelf before that time. "
+                "Choose an earlier pickup time, or take that item out of the pickup."
+            ),
+        )
+    return [_detail(r) for r in db_order.reservations]
+
+
+@router.post("/orders/{order_id}/cancel", response_model=list[schemas.ReservationDetailOut])
+def cancel_pickup_order(
+    order_id: str,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_organizer),
+):
+    """Cancels a whole pickup; every item returns to the available pool."""
+    db_order = crud.cancel_order(db, order_id, pantry_id=user.pantry_id)
+    if not db_order:
+        # 404 for "not yours" and "nothing pending" alike — see FR-2.4.
+        raise HTTPException(
+            status_code=404,
+            detail="No pending pickup with that ID under your organization.",
+        )
+    return [_detail(r) for r in db_order.reservations]
 
 
 @router.get("/mine", response_model=list[schemas.ReservationDetailOut])

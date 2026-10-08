@@ -122,6 +122,18 @@ def get_item(db: Session, item_id: str, store_ids: Optional[list[str]] = None) -
     return _in_scope(db.query(models.Item).filter(models.Item.id == item_id), models.Item, store_ids).first()
 
 
+def _pickup_store_ids():
+    """
+    Stores a pantry can collect from right now: active, and not marked closed.
+    One definition, used both to list what a pantry can see and to decide what
+    it can claim, so the list never offers food the claim would then refuse.
+    """
+    return select(models.Store.id).where(
+        models.Store.active == True,  # noqa: E712
+        models.Store.open_for_pickup == True,  # noqa: E712
+    )
+
+
 def list_items(
     db: Session,
     status: Optional[models.ItemStatus] = None,
@@ -130,13 +142,14 @@ def list_items(
 ):
     """
     `store_ids` scopes staff views. `active_stores_only` is for the pantry
-    side: food from every active store is offered, and a deactivated store's
-    food is withdrawn from the pool without touching its own records.
+    side: food from every store open for pickups is offered, and a
+    deactivated or closed store's food is withdrawn from the pool without
+    touching its own records.
     """
     q = db.query(models.Item)
     q = _in_scope(q, models.Item, store_ids)
     if active_stores_only:
-        q = q.join(models.Store, models.Item.store_id == models.Store.id).filter(models.Store.active == True)  # noqa: E712
+        q = q.filter(models.Item.store_id.in_(_pickup_store_ids()))
     if status:
         q = q.filter(models.Item.status == status)
     return q.order_by(models.Item.sell_by_date.asc().nullslast()).all()
@@ -266,6 +279,79 @@ def list_mappable_stores(db: Session) -> list[models.Store]:
         .order_by(models.Store.name.asc())
         .all()
     )
+
+
+def set_store_open(db: Session, store_id: str, open_for_pickup: bool) -> Optional[models.Store]:
+    """Open or close a location for pickups. Reservations already made are
+    left alone: closing stops new ones, it does not cancel a pantry's trip."""
+    store = db.get(models.Store, store_id)
+    if not store:
+        return None
+    store.open_for_pickup = open_for_pickup
+    db.commit()
+    db.refresh(store)
+    return store
+
+
+def list_pickup_locations(
+    db: Session, center: Optional[tuple[float, float]] = None
+) -> list[dict]:
+    """
+    Every located, active store with what a pantry needs to choose between
+    them: how many items it can collect there, and whether the location is
+    available at all (FR-8.14).
+
+    A location is available when it is open for pickups and has something to
+    collect. Unavailable ones are kept in the list rather than dropped, marked
+    with the reason — a pantry looking for the nearest shelf should see that
+    the closest one is closed, not wonder why it is missing.
+
+    Ordering: available first, then nearest to `center` when there is one,
+    otherwise by name. Closed or empty locations never outrank one that has
+    food, however close they are.
+    """
+    counts = dict(
+        db.query(models.Item.store_id, func.count(models.Item.id))
+        .filter(models.Item.status == models.ItemStatus.AVAILABLE)
+        .group_by(models.Item.store_id)
+        .all()
+    )
+    rows = []
+    for store in list_mappable_stores(db):
+        count = counts.get(store.id, 0)
+        if not store.open_for_pickup:
+            reason = "closed"
+        elif count == 0:
+            reason = "no_items"
+        else:
+            reason = None
+        distance = (
+            round(geocode.distance_miles(center, (store.latitude, store.longitude)), 1)
+            if center
+            else None
+        )
+        rows.append(
+            {
+                "id": store.id,
+                "name": store.name,
+                "address": store.address,
+                "latitude": store.latitude,
+                "longitude": store.longitude,
+                "open_for_pickup": store.open_for_pickup,
+                "available_count": count,
+                "available": reason is None,
+                "unavailable_reason": reason,
+                "distance_miles": distance,
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            not r["available"],
+            r["distance_miles"] if r["distance_miles"] is not None else 0,
+            r["name"].lower(),
+        )
+    )
+    return rows
 
 
 def list_stores(db: Session, store_ids: Optional[list[str]] = None):
@@ -708,6 +794,27 @@ def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
 
 # ---------- Reservations ----------
 
+def _claim_item(db: Session, item_id: str) -> bool:
+    """
+    Flip one AVAILABLE item to RESERVED, and report whether this call won it.
+    A conditional UPDATE, so the database decides the winner when two
+    organizations race for the same item (NFR-4.7.1). Only food from a store
+    open for pickups can be claimed: a deactivated or closed store's stock
+    stays on its own records but leaves the pantry pool at once.
+    """
+    claimed = (
+        db.query(models.Item)
+        .filter(models.Item.id == item_id)
+        .filter(models.Item.status == models.ItemStatus.AVAILABLE)
+        .filter(models.Item.store_id.in_(_pickup_store_ids()))
+        .update(
+            {models.Item.status: models.ItemStatus.RESERVED},
+            synchronize_session=False,
+        )
+    )
+    return claimed == 1
+
+
 def create_reservation(
     db: Session,
     res: schemas.ReservationCreate,
@@ -737,20 +844,7 @@ def create_reservation(
     Returns (reservation, outcome). Outcomes: "ok", "unavailable" (lost the
     race or never eligible), "past_discard" (see below).
     """
-    # Only food from an active store can be claimed. A deactivated store's
-    # stock stays on its own records but leaves the pantry pool at once.
-    active_store_ids = select(models.Store.id).where(models.Store.active == True)  # noqa: E712
-    claimed = (
-        db.query(models.Item)
-        .filter(models.Item.id == res.item_id)
-        .filter(models.Item.status == models.ItemStatus.AVAILABLE)
-        .filter(models.Item.store_id.in_(active_store_ids))
-        .update(
-            {models.Item.status: models.ItemStatus.RESERVED},
-            synchronize_session=False,
-        )
-    )
-    if claimed == 0:
+    if not _claim_item(db, res.item_id):
         db.rollback()
         return None, "unavailable"
 
@@ -825,6 +919,96 @@ def cancel_reservation(db: Session, reservation_id: str, pantry_id: str) -> Opti
     return db_res
 
 
+def create_order(
+    db: Session,
+    order: schemas.PickupOrderCreate,
+    pantry_id: str,
+) -> tuple[Optional[models.PickupOrder], str, Optional[str]]:
+    """
+    Reserves several AVAILABLE items from one store for one trip, under one QR
+    code (FR-8.13). Returns (order, outcome, item_name).
+
+    All or nothing. If any one item has been taken, closed off, or cannot
+    last until the slot, nothing is reserved and the name of the item that
+    stopped it comes back, so the organization can drop it and try again. A
+    half-made order would leave a pantry holding some of a trip's food and
+    not knowing which.
+
+    Outcomes: "ok", "unavailable" (an item was taken or never eligible),
+    "mixed_stores" (items from more than one location — a trip goes to one
+    place), "past_discard" (an item has to leave the shelf before the slot).
+    Each item is claimed with the same conditional UPDATE a single
+    reservation uses, so two organizations racing for one item still produce
+    exactly one winner.
+    """
+    items = db.query(models.Item).filter(models.Item.id.in_(order.item_ids)).all()
+    if len(items) != len(order.item_ids):
+        return None, "unavailable", None
+    if len({item.store_id for item in items}) > 1:
+        return None, "mixed_stores", None
+    for item in items:
+        # The same guard a single reservation applies, per item: a slot past
+        # an item's discard time would be killed by the sweep before anyone
+        # arrived.
+        if item.discard_after and order.scheduled_pickup_at > item.discard_after:
+            return None, "past_discard", item.name
+
+    claimed = []
+    for item in items:
+        if not _claim_item(db, item.id):
+            db.rollback()
+            return None, "unavailable", item.name
+        claimed.append(item)
+
+    db_order = models.PickupOrder(
+        pantry_id=pantry_id,
+        store_id=items[0].store_id,
+        qr_code=secrets.token_urlsafe(16),
+        scheduled_pickup_at=order.scheduled_pickup_at,
+        hold_expires_at=order.scheduled_pickup_at + schemas.PICKUP_GRACE,
+    )
+    db.add(db_order)
+    db.flush()
+    for item in claimed:
+        db.add(
+            models.Reservation(
+                item_id=item.id,
+                pantry_id=pantry_id,
+                order_id=db_order.id,
+                scheduled_pickup_at=db_order.scheduled_pickup_at,
+                hold_expires_at=db_order.hold_expires_at,
+                # The order carries the one code; see Reservation.qr_code.
+                qr_code=None,
+            )
+        )
+    db.commit()
+    db.refresh(db_order)
+    return db_order, "ok", None
+
+
+def cancel_order(db: Session, order_id: str, pantry_id: str) -> Optional[models.PickupOrder]:
+    """
+    Cancels every still-pending item in an order and returns them to the pool.
+    None when the order is not this organization's or has nothing pending —
+    the router renders both as 404, for the same reason cancel_reservation
+    does (FR-2.4).
+    """
+    db_order = db.get(models.PickupOrder, order_id)
+    if not db_order or db_order.pantry_id != pantry_id:
+        return None
+    pending = [r for r in db_order.reservations if r.status == models.ReservationStatus.PENDING]
+    if not pending:
+        return None
+    for res in pending:
+        res.status = models.ReservationStatus.CANCELLED
+        item = db.get(models.Item, res.item_id)
+        if item:
+            item.status = models.ItemStatus.AVAILABLE
+    db.commit()
+    db.refresh(db_order)
+    return db_order
+
+
 def expire_stale_reservations(db: Session):
     """
     Run periodically (cron / background task). Any PENDING reservation past
@@ -878,7 +1062,8 @@ def confirm_pickup(
     """
     db_res = db.query(models.Reservation).filter(models.Reservation.qr_code == qr_code).first()
     if not db_res:
-        return None, "not_found"
+        # Not a single reservation's code; it may be a whole order's.
+        return _confirm_order_pickup(db, qr_code, confirmed_by_user_id, store_ids)
 
     # A code for another store's food reads exactly like an unknown code.
     # Saying "that belongs to another store" would confirm it exists (FR-2.4).
@@ -894,14 +1079,31 @@ def confirm_pickup(
         return db_res, "expired"
 
     if db_res.hold_expires_at and db_res.hold_expires_at < datetime.utcnow():
-        db_res.status = models.ReservationStatus.EXPIRED
-        item = db.get(models.Item, db_res.item_id)
-        if item:
-            item.status = models.ItemStatus.AVAILABLE
+        _expire_reservation(db, db_res)
         db.commit()
         db.refresh(db_res)
         return db_res, "expired"
 
+    _hand_over(db, db_res, confirmed_by_user_id)
+    db.commit()
+    db.refresh(db_res)
+    return db_res, "ok"
+
+
+def _expire_reservation(db: Session, db_res: models.Reservation) -> None:
+    """A lapsed hold: mark it expired and put the item back in the pool."""
+    db_res.status = models.ReservationStatus.EXPIRED
+    item = db.get(models.Item, db_res.item_id)
+    if item:
+        item.status = models.ItemStatus.AVAILABLE
+
+
+def _hand_over(db: Session, db_res: models.Reservation, confirmed_by_user_id: str) -> None:
+    """
+    Completes one reservation: picked up, item picked up, and the donation
+    record written. Shared by a single-reservation scan and an order scan so
+    the audit trail is identical either way — one record per item.
+    """
     db_res.status = models.ReservationStatus.PICKED_UP
     db_res.picked_up_at = datetime.utcnow()
     item = db.get(models.Item, db_res.item_id)
@@ -927,9 +1129,49 @@ def confirm_pickup(
         confirmed_at=db_res.picked_up_at,
     ))
 
+
+def _confirm_order_pickup(
+    db: Session, qr_code: str, confirmed_by_user_id: str, store_ids: Optional[list[str]]
+) -> tuple[Optional[models.Reservation], str]:
+    """
+    Redeems an order's QR code: every still-pending item in it is handed over
+    at once. Returns one of the order's reservations to stand for it — the
+    router reports the whole trip from `reservation.order`.
+
+    Same rules as a single scan. The order's hold governs, not the sweep
+    (FR-9.7); another store's order code reads as unknown (FR-2.4); and a
+    second scan reports what already happened (FR-9.8). An item the
+    organization cancelled before arriving is skipped rather than blocking
+    the rest of the trip.
+    """
+    order = db.query(models.PickupOrder).filter(models.PickupOrder.qr_code == qr_code).first()
+    if not order or (store_ids is not None and order.store_id not in store_ids):
+        return None, "not_found"
+
+    members = list(order.reservations)
+    pending = [r for r in members if r.status == models.ReservationStatus.PENDING]
+    if not pending:
+        for status, outcome in (
+            (models.ReservationStatus.PICKED_UP, "already_picked_up"),
+            (models.ReservationStatus.EXPIRED, "expired"),
+        ):
+            match = next((r for r in members if r.status == status), None)
+            if match:
+                return match, outcome
+        return (members[0] if members else None), "cancelled"
+
+    if order.hold_expires_at < datetime.utcnow():
+        for res in pending:
+            _expire_reservation(db, res)
+        db.commit()
+        db.refresh(pending[0])
+        return pending[0], "expired"
+
+    for res in pending:
+        _hand_over(db, res, confirmed_by_user_id)
     db.commit()
-    db.refresh(db_res)
-    return db_res, "ok"
+    db.refresh(pending[0])
+    return pending[0], "ok"
 
 
 # ---------- Donation records (FR-11.1) ----------
