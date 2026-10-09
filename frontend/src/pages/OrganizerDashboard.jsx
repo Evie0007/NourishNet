@@ -235,6 +235,7 @@ export default function OrganizerDashboard() {
     <Shell
       title={user?.pantry_name || "Donation portal"}
       subtitle="Browse what's available, add it to an order, and show the order's code at the shelf."
+      fixed
     >
       <ErrorBanner message={error} onDismiss={() => setError("")} />
 
@@ -252,38 +253,51 @@ export default function OrganizerDashboard() {
       {loading ? (
         <p className="text-sm text-gray-500">Loading…</p>
       ) : (
-        <div className="grid gap-6 lg:grid-cols-5">
-          {locations.length > 0 && (
-            <Card
-              title="Where the food is"
-              className="lg:col-span-5"
-              action={
-                selectedStoreId && (
-                  <button
-                    onClick={() => setSelectedStoreId(null)}
-                    className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
-                  >
-                    Show all shelves
-                  </button>
-                )
-              }
-            >
-              <ShelfFinder
-                locations={locations}
-                center={center}
-                selectedId={selectedStoreId}
-                onSelect={(id) => setSelectedStoreId(id === selectedStoreId ? null : id)}
-                onSearch={searchZip}
-                onClear={clearZip}
-                searching={searching}
-                searchError={searchError}
-              />
-            </Card>
-          )}
+        // On large screens the page fits the window and each panel scrolls on
+        // its own: the map and the list stay side by side with the order, so
+        // adding an item never scrolls the basket out of view.
+        <div className="grid gap-6 lg:min-h-0 lg:flex-1 lg:grid-cols-5 lg:grid-rows-1">
+          <div
+            className={`flex flex-col gap-6 lg:col-span-3 lg:grid lg:min-h-0 ${
+              locations.length > 0
+                ? "lg:grid-rows-[minmax(0,2fr)_minmax(0,3fr)]"
+                : "lg:grid-rows-1"
+            }`}
+          >
+            {locations.length > 0 && (
+              <Card
+                title="Where the food is"
+                className="lg:flex lg:min-h-0 lg:flex-col"
+                bodyClassName="p-4 lg:min-h-0 lg:flex-1"
+                action={
+                  selectedStoreId && (
+                    <button
+                      onClick={() => setSelectedStoreId(null)}
+                      className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+                    >
+                      Show all shelves
+                    </button>
+                  )
+                }
+              >
+                <ShelfFinder
+                  locations={locations}
+                  center={center}
+                  selectedId={selectedStoreId}
+                  onSelect={(id) => setSelectedStoreId(id === selectedStoreId ? null : id)}
+                  onSearch={searchZip}
+                  onClear={clearZip}
+                  searching={searching}
+                  searchError={searchError}
+                  fill
+                />
+              </Card>
+            )}
 
-          <div className="space-y-6 lg:col-span-3">
             <Card
               title={`Available donations (${visible.length})`}
+              className="lg:flex lg:min-h-0 lg:flex-col"
+              bodyClassName="p-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto"
               action={
                 <div className="flex gap-2">
                   <select
@@ -359,7 +373,7 @@ export default function OrganizerDashboard() {
             </Card>
           </div>
 
-          <div className="space-y-6 lg:col-span-2">
+          <div className="space-y-6 lg:col-span-2 lg:min-h-0 lg:overflow-y-auto">
             {(lines.length > 0 || basketNotice) && (
               <PickupBasket
                 lines={lines}

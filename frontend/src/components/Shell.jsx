@@ -7,12 +7,23 @@ const ROLE_LABELS = {
   org_coordinator: "Organizer",
 };
 
-/** Header + page frame shared by both dashboards. */
-export default function Shell({ title, subtitle, children }) {
+/**
+ * Header + page frame shared by both dashboards.
+ *
+ * `fixed` pins the page to the window on large screens so the panels inside
+ * scroll on their own instead of the whole page. It is opt-in because the
+ * staff dashboard is a long working list that is meant to scroll as a page.
+ * Below `lg` it does nothing: stacked panels on a phone have to scroll.
+ */
+export default function Shell({ title, subtitle, children, fixed = false }) {
   const { user, logout } = useAuth();
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900">
+    <div
+      className={`bg-gray-50 text-gray-900 ${
+        fixed ? "min-h-screen lg:flex lg:h-screen lg:min-h-160 lg:flex-col" : "min-h-screen"
+      }`}
+    >
       <header className="border-b border-gray-200 bg-white">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-3">
           <div className="flex items-center gap-2.5">
@@ -40,7 +51,11 @@ export default function Shell({ title, subtitle, children }) {
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-6 py-8">
+      <main
+        className={`mx-auto w-full max-w-6xl px-6 ${
+          fixed ? "py-6 lg:flex lg:min-h-0 lg:flex-1 lg:flex-col" : "py-8"
+        }`}
+      >
         <div className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
           {subtitle && <p className="mt-1 text-sm text-gray-500">{subtitle}</p>}
@@ -51,7 +66,7 @@ export default function Shell({ title, subtitle, children }) {
   );
 }
 
-export function Card({ title, action, children, className = "" }) {
+export function Card({ title, action, children, className = "", bodyClassName = "p-4" }) {
   return (
     <section className={`rounded-xl border border-gray-200 bg-white ${className}`}>
       {(title || action) && (
@@ -60,7 +75,7 @@ export function Card({ title, action, children, className = "" }) {
           {action}
         </div>
       )}
-      <div className="p-4">{children}</div>
+      <div className={bodyClassName}>{children}</div>
     </section>
   );
 }
