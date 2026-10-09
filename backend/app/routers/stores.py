@@ -78,10 +78,15 @@ def pickup_locations(
             raise HTTPException(status_code=422, detail="Enter a 5-digit US zip code.")
         center = geocode.geocode_zip(normalized)
         if not center:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Couldn't locate zip code {normalized}. Check it, or browse the map instead.",
+            # With the switch off every zip fails, and blaming the zip sent
+            # people retyping a correct one. Say which it is.
+            detail = (
+                f"Can't search by zip code {normalized}: zip lookup is turned off on this "
+                "server (GEOCODE_ENABLED). Browse the map instead."
+                if not geocode.GEOCODE_ENABLED
+                else f"Couldn't locate zip code {normalized}. Check it, or browse the map instead."
             )
+            raise HTTPException(status_code=422, detail=detail)
         center_out = {"zip": normalized, "latitude": center[0], "longitude": center[1]}
     return {"center": center_out, "locations": crud.list_pickup_locations(db, center=center)}
 
