@@ -16,6 +16,9 @@ const TABS = [
   { key: "donations", label: "Donation report" },
 ];
 
+/** Tabs laid out to fill the window, with their own scrolling panels. */
+const FILLED_TABS = new Set(["overview", "inventory"]);
+
 /** Reading older than this means the sensor or its network is down, not
  *  that conditions are fine (FR-4.7, NFR-4.4.4). */
 const STALE_READING_MINUTES = 15;
@@ -80,6 +83,7 @@ export default function StaffDashboard() {
     <Shell
       title="Store dashboard"
       subtitle="Review label reads, publish donations, and confirm pickups at the shelf."
+      fixed
     >
       <ErrorBanner message={error} onDismiss={() => setError("")} />
 
@@ -115,14 +119,23 @@ export default function StaffDashboard() {
       {loading ? (
         <p className="text-sm text-gray-500">Loading…</p>
       ) : (
-        <>
+        // On large screens the header and tabs stay put and only this area
+        // scrolls. Overview and Inventory fill it and scroll per panel
+        // instead, so their side columns never scroll away with a long list.
+        <div
+          className={`lg:min-h-0 lg:flex-1 ${
+            FILLED_TABS.has(tab) ? "" : "lg:-mr-2 lg:overflow-y-auto lg:pr-2"
+          }`}
+        >
           {tab === "overview" && (
             <Overview
               counts={counts}
               nearExpiry={nearExpiry}
               reservations={reservations}
+              reviewQueue={reviewQueue}
               shelves={shelves}
               shelfName={shelfName}
+              onOpenTab={setTab}
               onError={setError}
               onChanged={refresh}
             />
@@ -137,7 +150,7 @@ export default function StaffDashboard() {
           {tab === "rules" && <ExpirationRules onError={setError} onChanged={refresh} />}
           {tab === "shelves" && <Shelves shelves={shelves} onError={setError} onChanged={refresh} />}
           {tab === "donations" && <DonationReport onError={setError} />}
-        </>
+        </div>
       )}
     </Shell>
   );
@@ -207,21 +220,31 @@ function PickupAvailability({ stores, canEdit, onError, onChanged }) {
 
 /* ---------------- Overview ---------------- */
 
-const SUMMARY_ORDER = [
-  ["needs_review", "Needs review"],
-  ["available", "Available"],
-  ["reserved", "Reserved"],
-  ["in_stock", "In stock"],
-  ["picked_up", "Picked up"],
-  ["discarded", "Discarded"],
-];
+const TILE_TONES = {
+  plain: "border-gray-200 bg-white",
+  amber: "border-amber-200 bg-amber-50 text-amber-900",
+  emerald: "border-emerald-200 bg-emerald-50 text-emerald-900",
+  blue: "border-blue-200 bg-blue-50 text-blue-900",
+};
 
-function Overview({ counts, nearExpiry, reservations, shelves, shelfName, onError, onChanged }) {
-  // Scan state lives here, not in the schedule card, because the scanner
-  // renders full width below it and the camera result and the typed code
-  // both go through the same confirm(). One mounted scanner at a time keeps
-  // to a single getUserMedia call: on a single-camera laptop a second one
-  // fails with NotReadableError.
+/** How many reviews the overview shows before pointing at the full queue. */
+const REVIEW_PREVIEW_LIMIT = 4;
+
+function Overview({
+  counts,
+  nearExpiry,
+  reservations,
+  reviewQueue,
+  shelves,
+  shelfName,
+  onOpenTab,
+  onError,
+  onChanged,
+}) {
+  // Scan state lives here, not in the pickup card, because the camera result
+  // and the typed code both go through the same confirm(). One mounted
+  // scanner at a time keeps to a single getUserMedia call: on a single-camera
+  // laptop a second one fails with NotReadableError.
   const [scanOpen, setScanOpen] = useState(false);
   const [outcome, setOutcome] = useState(null);
 
@@ -245,75 +268,208 @@ function Overview({ counts, nearExpiry, reservations, shelves, shelfName, onErro
     [onError, onChanged],
   );
 
+  // "Today" is the viewer's day, which is the one a manager means when they
+  // ask how much went out — not the UTC day the timestamps are stored in.
+  const pickedUpToday = useMemo(() => {
+    const today = new Date().toDateString();
+    return reservations.filter(
+      (r) => r.status === "picked_up" && parseUtc(r.picked_up_at)?.toDateString() === today,
+    ).length;
+  }, [reservations]);
+
+  // FR-3.1
+  const tiles = [
+    ["In stock", counts.in_stock, "plain"],
+    ["Needs review", counts.needs_review, "amber"],
+    ["Near expiry", nearExpiry.length, "amber"],
+    ["Available", counts.available, "emerald"],
+    ["Reserved", counts.reserved, "blue"],
+    ["Picked up today", pickedUpToday, "plain"],
+  ];
+
   return (
-    <div className="space-y-6">
-      {/* FR-3.1 */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {SUMMARY_ORDER.map(([key, label]) => (
-          <div key={key} className="rounded-xl border border-gray-200 bg-white p-4">
-            <div className="text-2xl font-semibold tabular-nums">{counts[key] || 0}</div>
-            <div className="mt-1 text-xs text-gray-500">{label}</div>
+    <div className="flex flex-col gap-6 lg:h-full">
+      <div className="grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {tiles.map(([label, value, tone]) => (
+          <div key={label} className={`rounded-xl border p-4 ${TILE_TONES[tone]}`}>
+            <div className="text-2xl font-semibold tabular-nums">{value || 0}</div>
+            <div className="mt-1 text-xs opacity-80">{label}</div>
           </div>
         ))}
       </div>
 
-      <PickupSchedule
-        reservations={reservations}
-        scanOpen={scanOpen}
-        onScan={() => {
-          setOutcome(null);
-          setScanOpen((open) => !open);
-        }}
-        outcome={outcome}
-        onConfirmCode={confirm}
-      />
+      <div className="grid gap-6 lg:min-h-0 lg:flex-1 lg:grid-cols-3">
+        <div className="flex flex-col gap-6 lg:col-span-2 lg:min-h-0 lg:overflow-y-auto">
+          {/* FR-3.4 */}
+          <Card
+            title="Near expiry (next 48h)"
+            action={
+              <button
+                type="button"
+                onClick={() => onOpenTab("inventory")}
+                className="text-sm font-medium text-emerald-700 underline hover:text-emerald-900"
+              >
+                View inventory
+              </button>
+            }
+          >
+            {nearExpiry.length === 0 ? (
+              <Empty>Nothing approaching its sell-by date.</Empty>
+            ) : (
+              <ul className="divide-y divide-gray-100">
+                {nearExpiry.map((item) => (
+                  <li key={item.id} className="flex items-center justify-between gap-3 py-2.5 text-sm">
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{item.name}</div>
+                      <div className="truncate text-xs text-gray-500">
+                        {item.category || "Uncategorized"}
+                        {item.sku ? ` · ${item.sku}` : ""} · {shelfName(item.shelf_id)}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <span className="tabular-nums" title={formatDate(item.sell_by_date)}>
+                        {timeLeft(item.sell_by_date)}
+                      </span>
+                      <StatusBadge status={item.status} />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Card>
 
-      {/* Full width, because a 320px-tall video does not belong in a narrow
-          grid column. Unmounted rather than hidden, so the camera light
-          actually goes off. */}
-      {scanOpen && (
-        <BarcodeScanner
-          mode="qr"
-          onDetected={confirm}
-          onClose={() => setScanOpen(false)}
-        />
-      )}
+          <ReviewPreview queue={reviewQueue} onOpenTab={onOpenTab} onError={onError} onChanged={onChanged} />
+        </div>
 
-      {/* FR-3.4 — the backend endpoint existed all along, unused. */}
-      <Card title="Near expiry (next 48h)">
-        {nearExpiry.length === 0 ? (
-          <Empty>Nothing approaching its sell-by date.</Empty>
-        ) : (
-          <ul className="divide-y divide-gray-100">
-            {nearExpiry.map((item) => (
-              <li key={item.id} className="flex items-center justify-between gap-3 py-2 text-sm">
-                <div>
-                  <div className="font-medium">{item.name}</div>
-                  <div className="text-xs text-gray-500">{shelfName(item.shelf_id)}</div>
+        <div className="flex flex-col gap-6 lg:min-h-0 lg:overflow-y-auto">
+          <ConfirmPickup
+            scanOpen={scanOpen}
+            onScan={() => {
+              setOutcome(null);
+              setScanOpen((open) => !open);
+            }}
+            outcome={outcome}
+            onConfirmCode={confirm}
+          />
+
+          {/* Unmounted rather than hidden, so the camera light actually goes
+              off. Directly under the button that opened it, in the column the
+              staff member is already looking at. */}
+          {scanOpen && (
+            <BarcodeScanner mode="qr" onDetected={confirm} onClose={() => setScanOpen(false)} />
+          )}
+
+          <PickupSchedule reservations={reservations} />
+
+          {/* FR-3.6 */}
+          <Card title="Shelf conditions">
+            {shelves.length === 0 ? (
+              <Empty>No shelves registered yet.</Empty>
+            ) : (
+              <div className="space-y-4">
+                {shelves.map((shelf) => (
+                  <ShelfConditionCard key={shelf.id} shelf={shelf} />
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The first few label reads waiting on a person, so the common case — the
+ * date OCR read is right — is one click from the overview. Anything that
+ * needs a different date goes to the full review card, which has the label
+ * text and photo to judge it by. Publishing here is the same human
+ * confirmation as there, not a way around it.
+ */
+function ReviewPreview({ queue, onOpenTab, onError, onChanged }) {
+  const [busyId, setBusyId] = useState(null);
+  const shown = queue.slice(0, REVIEW_PREVIEW_LIMIT);
+
+  async function confirmDate(item) {
+    onError("");
+    setBusyId(item.id);
+    try {
+      await api.updateItemStatus(item.id, "available");
+      onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <Card
+      title="Review queue"
+      action={<span className="text-xs text-gray-500">Low-confidence label reads wait here</span>}
+    >
+      {shown.length === 0 ? (
+        <Empty>Nothing waiting on review.</Empty>
+      ) : (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {shown.map((item) => (
+              <div key={item.id} className="flex flex-col rounded-lg border border-gray-200 p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <h3 className="min-w-0 truncate font-medium">{item.name}</h3>
+                  <StatusBadge status={item.status} />
                 </div>
-                <div className="text-right text-xs text-gray-600">
-                  <div>{formatDate(item.sell_by_date)}</div>
-                  <div className="text-gray-400">{relativeTo(item.sell_by_date)}</div>
+                <p className="mt-1 flex-1 text-xs text-gray-500">
+                  {item.category || "Uncategorized"} ·{" "}
+                  {item.sku ? `SKU ${item.sku}` : "no barcode match"} ·{" "}
+                  {item.sell_by_date ? (
+                    <>
+                      OCR read <span className="font-medium text-gray-800">{formatShortDate(item.sell_by_date)}</span>
+                    </>
+                  ) : (
+                    "no date read"
+                  )}
+                  {item.ocr_confidence != null && ` at ${(item.ocr_confidence * 100).toFixed(0)}% confidence`}
+                </p>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  {item.sell_by_date ? (
+                    <button
+                      onClick={() => confirmDate(item)}
+                      disabled={busyId === item.id}
+                      className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+                    >
+                      Confirm date
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => onOpenTab("review")}
+                      className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+                    >
+                      Pick a date
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onOpenTab("review")}
+                    className="rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    Edit
+                  </button>
                 </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </Card>
-
-      {/* FR-3.6 */}
-      <Card title="Shelf conditions">
-        {shelves.length === 0 ? (
-          <Empty>No shelves registered yet.</Empty>
-        ) : (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {shelves.map((shelf) => (
-              <ShelfConditionCard key={shelf.id} shelf={shelf} />
+              </div>
             ))}
           </div>
-        )}
-      </Card>
-    </div>
+          {queue.length > shown.length && (
+            <button
+              type="button"
+              onClick={() => onOpenTab("review")}
+              className="mt-3 text-xs font-medium text-gray-500 underline hover:text-gray-800"
+            >
+              +{queue.length - shown.length} more in the review queue
+            </button>
+          )}
+        </>
+      )}
+    </Card>
   );
 }
 
@@ -323,20 +479,31 @@ function ShelfConditionCard({ shelf }) {
   const stale = ageMinutes === null || ageMinutes > STALE_READING_MINUTES;
 
   return (
-    <div className="rounded-lg border border-gray-200 p-3">
-      <div className="font-medium">{shelf.name}</div>
-      <div className="text-xs text-gray-500">{shelf.location || "No location set"}</div>
-      <div className="mt-2 flex items-baseline gap-3 text-sm">
-        <span className="tabular-nums">
-          {shelf.current_temperature_c != null ? `${shelf.current_temperature_c}°C` : "—"}
-        </span>
-        <span className="tabular-nums text-gray-500">
-          {shelf.current_humidity_pct != null ? `${shelf.current_humidity_pct}% RH` : "—"}
+    <div>
+      <div className="flex items-baseline justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate font-medium">{shelf.name}</div>
+          <div className="truncate text-xs text-gray-500">{shelf.location || "No location set"}</div>
+        </div>
+        <span className={`shrink-0 text-xs ${stale ? "font-medium text-amber-700" : "text-gray-500"}`}>
+          {stale ? "⚠ No recent reading" : `updated ${relativeTo(shelf.last_reading_at)}`}
         </span>
       </div>
-      <div className={`mt-1 text-xs ${stale ? "font-medium text-amber-700" : "text-gray-400"}`}>
-        {stale ? "⚠ No recent reading — check the sensor" : `Updated ${relativeTo(shelf.last_reading_at)}`}
+      <div className="mt-2 grid grid-cols-2 gap-3">
+        <div className="rounded-lg bg-gray-50 p-3">
+          <div className="text-xl font-semibold tabular-nums">
+            {shelf.current_temperature_c != null ? `${shelf.current_temperature_c}°C` : "—"}
+          </div>
+          <div className="text-xs text-gray-500">Temperature</div>
+        </div>
+        <div className="rounded-lg bg-gray-50 p-3">
+          <div className="text-xl font-semibold tabular-nums">
+            {shelf.current_humidity_pct != null ? `${shelf.current_humidity_pct}% RH` : "—"}
+          </div>
+          <div className="text-xs text-gray-500">Humidity</div>
+        </div>
       </div>
+      {stale && <p className="mt-1.5 text-xs text-amber-700">Check the sensor.</p>}
     </div>
   );
 }
@@ -373,16 +540,15 @@ function ScanOutcome({ outcome }) {
 }
 
 /**
- * Camera first, keyboard second.
+ * Camera first, keyboard right under it.
  *
- * The code is already a QR on the organizer's phone, so typing out
- * twenty-two base64 characters at the shelf was work nobody needed to do.
- * Manual entry stays, folded away: a dead phone battery, a cracked lens or
- * a browser without camera permission must not be able to block a handoff
- * (FR-9.10).
+ * The code is already a QR on the organizer's phone, so the scan button leads.
+ * The typed code sits in plain view beneath it rather than folded away: a dead
+ * phone battery, a cracked lens or a browser without camera permission must
+ * not be able to block a handoff (FR-9.10), and a fallback behind an extra
+ * click is one people miss at the shelf.
  */
-function ManualCodeEntry({ onConfirmCode }) {
-  const [manualOpen, setManualOpen] = useState(false);
+function ConfirmPickup({ scanOpen, onScan, outcome, onConfirmCode }) {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -398,35 +564,42 @@ function ManualCodeEntry({ onConfirmCode }) {
   }
 
   return (
-    <div className="mt-3">
+    <Card title="Confirm pickup">
+      <ScanOutcome outcome={outcome} />
       <button
         type="button"
-        onClick={() => setManualOpen((open) => !open)}
-        aria-expanded={manualOpen}
-        className="text-xs font-medium text-gray-500 underline hover:text-gray-800"
+        onClick={onScan}
+        aria-expanded={scanOpen}
+        className="w-full rounded-lg bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-700"
       >
-        {manualOpen ? "Hide manual entry" : "Can't scan? Enter code"}
+        {scanOpen ? "Close camera" : "Scan pantry QR code"}
       </button>
 
-      {manualOpen && (
-        <form onSubmit={handleSubmit} className="mt-2 flex gap-2">
+      <form onSubmit={handleSubmit} className="mt-4">
+        <label htmlFor="pickup-code" className="block text-xs font-medium text-gray-700">
+          Or enter the pickup code
+        </label>
+        <div className="mt-1.5 flex gap-2">
           <input
+            id="pickup-code"
             value={code}
             onChange={(e) => setCode(e.target.value)}
             required
             placeholder="Pickup code"
-            aria-label="Pickup code"
             className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
           />
           <button
             disabled={busy}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium hover:bg-gray-50 disabled:opacity-60"
           >
-            {busy ? "…" : "Confirm"}
+            {busy ? "…" : "Check"}
           </button>
-        </form>
-      )}
-    </div>
+        </div>
+      </form>
+      <p className="mt-3 text-xs text-gray-500">
+        Staff confirm the handoff — the pantry cannot confirm its own.
+      </p>
+    </Card>
   );
 }
 
@@ -440,7 +613,7 @@ function ManualCodeEntry({ onConfirmCode }) {
 const RESOLVED_VISIBLE_HOURS = 4;
 const SCHEDULE_ROW_LIMIT = 12;
 
-function PickupSchedule({ reservations, scanOpen, onScan, outcome, onConfirmCode }) {
+function PickupSchedule({ reservations }) {
   const rows = useMemo(() => {
     const cutoff = Date.now() - RESOLVED_VISIBLE_HOURS * 3600_000;
     const sorted = reservations
@@ -469,26 +642,7 @@ function PickupSchedule({ reservations, scanOpen, onScan, outcome, onConfirmCode
   const shown = rows.slice(0, SCHEDULE_ROW_LIMIT);
 
   return (
-    <Card
-      title="Pickup schedule"
-      action={
-        <button
-          type="button"
-          onClick={onScan}
-          aria-expanded={scanOpen}
-          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700"
-        >
-          {scanOpen ? "Close camera" : "Scan QR code"}
-        </button>
-      }
-    >
-      <p className="mb-3 text-sm text-gray-500">
-        Scan the QR code on the organizer's phone. Staff confirm the handoff —
-        the pantry cannot confirm its own.
-      </p>
-
-      <ScanOutcome outcome={outcome} />
-
+    <Card title="Pickup schedule">
       {shown.length === 0 ? (
         <Empty>No pickups scheduled.</Empty>
       ) : (
@@ -505,8 +659,6 @@ function PickupSchedule({ reservations, scanOpen, onScan, outcome, onConfirmCode
           )}
         </>
       )}
-
-      <ManualCodeEntry onConfirmCode={onConfirmCode} />
     </Card>
   );
 }
@@ -515,28 +667,34 @@ function ScheduleRow({ group }) {
   // A trip is still due while any of its items is pending, so it leads.
   const reservation = group.find((r) => r.status === "pending") || group[0];
   const slot = parseUtc(reservation.scheduled_pickup_at);
+  const pending = reservation.status === "pending";
   // The point of the card for a manager: who was due and hasn't turned up.
-  const overdue = reservation.status === "pending" && slot && slot.getTime() < Date.now();
+  const overdue = pending && slot && slot.getTime() < Date.now();
 
   return (
-    <li
-      className={`flex flex-wrap items-center justify-between gap-3 py-2 text-sm ${
-        overdue ? "bg-amber-50" : ""
-      }`}
-    >
-      <div className="min-w-0">
-        <div className={`font-medium ${overdue ? "text-amber-900" : ""}`}>
+    <li className={`py-3 text-sm first:pt-0 last:pb-0 ${overdue ? "bg-amber-50" : ""}`}>
+      <div className="flex items-baseline justify-between gap-3">
+        <span className={`min-w-0 truncate font-medium ${overdue ? "text-amber-900" : ""}`}>
+          {reservation.pantry_name}
+        </span>
+        <span className="shrink-0 font-medium tabular-nums">
           {slot ? formatDateTime(reservation.scheduled_pickup_at) : "Not scheduled"}
-          {overdue && <span className="ml-2 text-xs font-normal">· overdue</span>}
-        </div>
-        <div className="mt-0.5 truncate text-xs text-gray-500">
-          {reservation.order_id && (
-            <span className="font-medium text-gray-700">Order #{orderNumber(reservation.order_id)} · </span>
-          )}
-          {describeItems(group)} · {reservation.pantry_name}
-        </div>
+        </span>
       </div>
-      <StatusBadge status={reservation.status} />
+      <div className="mt-0.5 text-xs text-gray-500">
+        {reservation.order_id && (
+          <span className="font-medium text-gray-700">Order #{orderNumber(reservation.order_id)} · </span>
+        )}
+        {describeItems(group)}
+        {group.length > 1 && " — one QR code"}
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs">
+        <StatusBadge status={reservation.status} />
+        {overdue && <span className="font-medium text-amber-800">Overdue</span>}
+        {pending && reservation.hold_expires_at && (
+          <span className="text-gray-600">Hold ends {relativeTo(reservation.hold_expires_at)}</span>
+        )}
+      </div>
     </li>
   );
 }
@@ -721,12 +879,16 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
   const input = "rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100";
 
   return (
-    <div className="space-y-6">
+    // Fills the window on large screens: the table takes the left two thirds
+    // and scrolls inside its card with the header pinned, so filtering a long
+    // list never pushes the add form or the catalog off screen. On a phone it
+    // stacks in source order — add, list, catalog — as it always did.
+    <div className="grid gap-6 lg:h-full lg:grid-cols-3 lg:grid-rows-[auto_minmax(0,1fr)]">
       {/* FR-3.8 — now carries category and sell-by date, not just name/SKU. */}
-      <Card title="Add an item">
-        <form onSubmit={handleCreate} className="flex flex-wrap items-end gap-2">
+      <Card title="Add an item" className="lg:col-start-3 lg:row-start-1">
+        <form onSubmit={handleCreate} className="grid gap-2 sm:grid-cols-2">
           <input
-            className={input}
+            className={`${input} sm:col-span-2`}
             placeholder="Item name"
             required
             value={form.name}
@@ -761,7 +923,7 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
             <label className="block text-xs text-gray-500">Sell-by</label>
             <input
               type="date"
-              className={input}
+              className={`${input} w-full`}
               value={form.sell_by_date}
               onChange={(e) => setForm({ ...form, sell_by_date: e.target.value })}
             />
@@ -773,14 +935,14 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
               min="0"
               step="0.01"
               placeholder="from catalog"
-              className={`${input} w-28`}
+              className={`${input} w-full`}
               value={form.unit_value}
               onChange={(e) => setForm({ ...form, unit_value: e.target.value })}
             />
           </div>
           <button
             disabled={busy}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60 sm:col-span-2"
           >
             Add item
           </button>
@@ -790,6 +952,8 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
       {/* FR-3.5 */}
       <Card
         title={`Inventory (${visible.length})`}
+        className="lg:col-span-2 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:min-h-0 lg:flex-col"
+        bodyClassName="px-4 pb-4 lg:min-h-0 lg:flex-1 lg:overflow-auto"
         action={
           <div className="flex gap-2">
             <select
@@ -824,9 +988,12 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
         {visible.length === 0 ? (
           <Empty>No items match this filter.</Empty>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto lg:overflow-visible">
             <table className="w-full text-left text-sm">
-              <thead className="text-xs uppercase tracking-wide text-gray-500">
+              {/* Sticky so the columns stay labelled while the list scrolls
+                  inside the card. The body's top padding moved onto the cells
+                  for the same reason: padding above a sticky row scrolls. */}
+              <thead className="sticky top-0 z-10 bg-white text-xs uppercase tracking-wide text-gray-500 [&_th]:pt-4">
                 <tr>
                   <th className="pb-2 pr-4 font-medium">Item</th>
                   <th className="pb-2 pr-4 font-medium">Shelf</th>
@@ -892,10 +1059,12 @@ function Inventory({ items, shelves, shelfName, onError, onChanged }) {
         )}
       </Card>
 
-      <ProductCatalog onError={onError} />
+      <div className="space-y-6 lg:col-start-3 lg:row-start-2 lg:min-h-0 lg:overflow-y-auto">
+        <ProductCatalog onError={onError} />
 
-      {/* FR-3.11: development-only, never in a deployed build. */}
-      {import.meta.env.DEV && <OcrSimulator items={items} onError={onError} onChanged={onChanged} />}
+        {/* FR-3.11: development-only, never in a deployed build. */}
+        {import.meta.env.DEV && <OcrSimulator items={items} onError={onError} onChanged={onChanged} />}
+      </div>
     </div>
   );
 }
@@ -1543,6 +1712,24 @@ function formatDateTime(value) {
   return today
     ? `Today ${time}`
     : `${d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} ${time}`;
+}
+
+/** "Oct 09" — the review cards only need the day OCR read. */
+function formatShortDate(value) {
+  const d = parseUtc(value);
+  return d ? d.toLocaleDateString(undefined, { month: "short", day: "2-digit" }) : "—";
+}
+
+/** Countdown for the near-expiry list: hours while it is within two days,
+ *  because that is the window the list covers and "1d" hides a 23h gap. */
+function timeLeft(value) {
+  const d = parseUtc(value);
+  if (!d) return "—";
+  const minutes = Math.round((d.getTime() - Date.now()) / 60000);
+  if (minutes <= 0) return "past date";
+  if (minutes < 60) return `${minutes}m left`;
+  if (minutes < 48 * 60) return `${Math.round(minutes / 60)}h left`;
+  return `${Math.round(minutes / 1440)}d left`;
 }
 
 function toDateInput(value) {
