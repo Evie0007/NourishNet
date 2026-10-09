@@ -141,7 +141,18 @@ export default function OrganizerDashboard() {
     () => Object.fromEntries(locations.map((s) => [s.id, s.name])),
     [locations],
   );
-  const basketStoreId = lines[0]?.group.store_id ?? null;
+  // An order is one trip to one shelf under one QR code (FR-8.13), so a
+  // basket spanning shelves is shown, timed and placed as one order per shelf
+  // rather than refused. First-added shelf first.
+  const shelfOrders = useMemo(() => {
+    const byStore = new Map();
+    for (const line of lines) {
+      const id = line.group.store_id;
+      if (!byStore.has(id)) byStore.set(id, []);
+      byStore.get(id).push(line);
+    }
+    return [...byStore].map(([storeId, storeLines]) => ({ storeId, lines: storeLines }));
+  }, [lines]);
 
   const categories = useMemo(
     () => [...new Set(available.map((i) => i.category).filter(Boolean))].sort(),
@@ -187,14 +198,6 @@ export default function OrganizerDashboard() {
       setBasket(basket.filter((b) => b.key !== group.key));
       return;
     }
-    // One trip goes to one shelf. Say which, so the fix is obvious.
-    if (lines.length > 0 && group.store_id !== basketStoreId && !basket.some((b) => b.key === group.key)) {
-      setError(
-        `Your order is at ${storeNames[basketStoreId] || "another shelf"}, and an order covers one ` +
-          `location. Place or clear it first to add items from ${storeNames[group.store_id] || "this shelf"}.`,
-      );
-      return;
-    }
     setBasket(
       basket.some((b) => b.key === group.key)
         ? basket.map((b) => (b.key === group.key ? { ...b, qty: clamped } : b))
@@ -202,13 +205,18 @@ export default function OrganizerDashboard() {
     );
   }
 
-  async function placeOrder(scheduledLocal) {
+  // Places one shelf's order. The other shelves' lines stay in the basket, so
+  // a failure at one shelf never costs the pantry what it picked elsewhere.
+  async function placeOrder(storeLines, scheduledLocal) {
     setError("");
     try {
       // Each line asks for N of a group; the order is the first N real units.
-      const itemIds = lines.flatMap((line) => line.group.items.slice(0, line.qty).map((i) => i.id));
+      const itemIds = storeLines.flatMap((line) =>
+        line.group.items.slice(0, line.qty).map((i) => i.id),
+      );
       await api.createOrder(itemIds, scheduledLocal);
-      setBasket([]);
+      const placed = new Set(storeLines.map((line) => line.key));
+      setBasket((current) => current.filter((b) => !placed.has(b.key)));
       setBasketNotice("");
       await refresh();
     } catch (err) {
@@ -374,19 +382,24 @@ export default function OrganizerDashboard() {
           </div>
 
           <div className="space-y-6 lg:col-span-2 lg:min-h-0 lg:overflow-y-auto">
-            {(lines.length > 0 || basketNotice) && (
+            {basketNotice && shelfOrders.length === 0 && (
+              <PickupBasket lines={[]} notice={basketNotice} />
+            )}
+            {shelfOrders.map(({ storeId, lines: storeLines }, index) => (
               <PickupBasket
-                lines={lines}
-                storeName={storeNames[basketStoreId]}
-                notice={basketNotice}
+                key={storeId}
+                lines={storeLines}
+                storeName={storeNames[storeId]}
+                notice={index === 0 ? basketNotice : ""}
                 onChange={(line, qty) => setQuantity(line.group, qty)}
                 onClear={() => {
-                  setBasket([]);
+                  const cleared = new Set(storeLines.map((line) => line.key));
+                  setBasket((current) => current.filter((b) => !cleared.has(b.key)));
                   setBasketNotice("");
                 }}
-                onConfirm={placeOrder}
+                onConfirm={(scheduledLocal) => placeOrder(storeLines, scheduledLocal)}
               />
-            )}
+            ))}
 
             <Card title={`Your orders (${pickups.length})`}>
               {pickups.length === 0 ? (
@@ -591,7 +604,8 @@ function AddToOrder({ group, qty, onChange, verified }) {
 /**
  * The order in progress: what has been added, waiting on a pickup time.
  * Nothing is reserved until the order is placed, and then it is all of it or
- * none (FR-8.13). `lines` is [{ key, qty, group }].
+ * none (FR-8.13). `lines` is [{ key, qty, group }], all from one shelf: the
+ * dashboard renders one of these per shelf in the basket.
  */
 function PickupBasket({ lines, storeName, notice, onChange, onClear, onConfirm }) {
   const totalUnits = lines.reduce((sum, line) => sum + line.qty, 0);
@@ -609,7 +623,9 @@ function PickupBasket({ lines, storeName, notice, onChange, onClear, onConfirm }
 
   return (
     <Card
-      title={`Your order (${totalUnits} item${totalUnits === 1 ? "" : "s"})`}
+      title={`${storeName ? `Order at ${storeName}` : "Your order"} (${totalUnits} item${
+        totalUnits === 1 ? "" : "s"
+      })`}
       action={
         lines.length > 0 && (
           <button
