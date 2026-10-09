@@ -173,6 +173,12 @@ def test_locations_are_for_organizers_only(client, staff_headers):
     assert client.get("/stores/pickup-locations", headers=staff_headers).status_code == 403
 
 
+def test_a_zip_search_with_lookup_off_says_so(client, organizer_headers):
+    res = client.get("/stores/pickup-locations", params={"zip": "95122"}, headers=organizer_headers)
+    assert res.status_code == 422
+    assert "turned off" in res.json()["detail"]
+
+
 def test_geocoding_a_zip_is_off_without_the_switch():
     assert geocode.geocode_zip("95125") is None
 
