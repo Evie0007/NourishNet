@@ -72,8 +72,12 @@ export function rgbToHsv(r, g, b) {
 function classify({ h, s, v }) {
   if (s < MIN_SATURATION || v < MIN_VALUE) return null;
   if (h >= 70 && h < 170) return "green";
-  if (h >= 42 && h < 70 && v >= 0.45) return "yellow";
-  if (h >= 8 && h < 42 && v >= 0.62) return "yellow";
+  // A yellow peel in shade or under a dim webcam keeps its hue and only loses
+  // brightness, so hue decides yellow here and value only has to rule out
+  // near-black. Judging by brightness first read ordinary yellow bananas as
+  // brown. Warm indoor light also drags yellow toward orange, hence 38.
+  if (h >= 38 && h < 70 && v >= 0.25) return "yellow";
+  if (h >= 8 && h < 38 && v >= 0.62) return "yellow";
   if (h >= 8 && h < 70) return "brown";
   return null;
 }
@@ -111,9 +115,11 @@ export function analyzeRipeness({ data, width, height }) {
 
   let picked;
   if (share.green >= 0.35) picked = stage("underripe");
-  else if (share.brown >= 0.6) picked = stage("past_best");
-  else if (share.brown >= 0.35) picked = stage("overripe");
-  else if (share.brown >= 0.1) picked = stage("very_ripe");
+  // Thresholds are loose on purpose: shadow at the edges and a stray bit of
+  // table count as "brown", so a handful of percent is noise, not spots.
+  else if (share.brown >= 0.7) picked = stage("past_best");
+  else if (share.brown >= 0.45) picked = stage("overripe");
+  else if (share.brown >= 0.3) picked = stage("very_ripe");
   else picked = stage("ripe");
 
   return {
