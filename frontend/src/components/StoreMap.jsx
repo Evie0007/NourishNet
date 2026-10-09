@@ -28,7 +28,13 @@ const SPOT = {
  * Markers are circles rather than the default pin, because Vite does not
  * bundle Leaflet's marker image by default and a broken pin looks like a bug.
  */
-export default function StoreMap({ locations, selectedId, onSelect, center }) {
+export default function StoreMap({
+  locations,
+  selectedId,
+  onSelect,
+  center,
+  className = "h-80 w-full rounded-lg lg:h-[26rem]",
+}) {
   const start = locations.length
     ? [locations[0].latitude, locations[0].longitude]
     : DEFAULT_CENTER;
@@ -38,7 +44,7 @@ export default function StoreMap({ locations, selectedId, onSelect, center }) {
       center={start}
       zoom={12}
       scrollWheelZoom={false}
-      className="h-80 w-full rounded-lg lg:h-[26rem]"
+      className={className}
     >
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'

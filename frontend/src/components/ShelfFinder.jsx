@@ -19,6 +19,7 @@ export default function ShelfFinder({
   onClear,
   searching,
   searchError,
+  fill = false,
 }) {
   const [typed, setTyped] = useState("");
 
@@ -34,8 +35,12 @@ export default function ShelfFinder({
   const closestAvailableId = center ? locations.find((l) => l.available)?.id : null;
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[18rem_1fr]">
-      <div className="flex min-w-0 flex-col gap-3">
+    <div
+      className={`grid gap-4 ${
+        fill ? "lg:h-full lg:grid-cols-[16rem_1fr] lg:grid-rows-1" : "lg:grid-cols-[18rem_1fr]"
+      }`}
+    >
+      <div className="flex min-w-0 flex-col gap-3 lg:min-h-0">
         <form onSubmit={submit}>
           <label htmlFor="zip-search" className="block text-xs font-medium text-gray-700">
             Find the closest shelf
@@ -87,7 +92,10 @@ export default function ShelfFinder({
           {availableCount} of {locations.length} shelves available for pickup.
         </p>
 
-        <ul className="space-y-2" aria-label="Shelves">
+        <ul
+          className={`space-y-2 ${fill ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : ""}`}
+          aria-label="Shelves"
+        >
           {locations.map((place) => {
             const selected = place.id === selectedId;
             return (
@@ -138,8 +146,14 @@ export default function ShelfFinder({
         </ul>
       </div>
 
-      <div className="min-w-0">
-        <StoreMap locations={locations} center={center} selectedId={selectedId} onSelect={onSelect} />
+      <div className="min-w-0 lg:min-h-0">
+        <StoreMap
+          locations={locations}
+          center={center}
+          selectedId={selectedId}
+          onSelect={onSelect}
+          className={fill ? "h-72 w-full rounded-lg lg:h-full" : undefined}
+        />
       </div>
     </div>
   );
