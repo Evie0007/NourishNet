@@ -27,8 +27,12 @@ eat. NourishNet connects that food with local pantries:
 4. **Pick up** — pantries find shelves on a map, reserve items, and collect
    them with one QR code.
 
-Built by a team of five students from different schools and majors, working
-remotely for five months.
+Built by:
+- Jacob Pimentel, Engineering Physics (Vanguard University)
+- Harshita Saripalli, Computer Engineering (UC Irvine)
+- Vy (Evie) Ho, Computer Science (San Jose State University)
+- David Arellano, Mechanical Engineering (CSU Los Angeles)
+- Bashar Zaher, Electrical Engineering (CSU Northridge)
 
 ## Screenshots
 
